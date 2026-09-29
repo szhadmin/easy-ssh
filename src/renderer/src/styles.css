@@ -1970,3 +1970,363 @@ textarea.input {
   color: #fff;
 }
 
+
+/* ------------------------------------------------- Agent 多轮时间线 */
+
+.agent-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.agent-run-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  padding: 12px 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.agent-run-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.agent-run-head b {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.agent-run-text {
+  font-size: 12.8px;
+  line-height: 1.75;
+  color: var(--text);
+  min-width: 0;
+}
+
+.agent-step {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: 9px;
+  padding: 9px 11px;
+  background: var(--panel-2);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.agent-step.st-pending {
+  border-left-color: var(--accent-2);
+}
+
+.agent-step.st-running {
+  border-left-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.agent-step.st-done {
+  border-left-color: var(--green);
+}
+
+.agent-step.st-failed,
+.agent-step.st-denied {
+  border-left-color: var(--red);
+}
+
+.agent-step.st-confirming {
+  border-left-color: var(--amber);
+  background: var(--amber-soft);
+}
+
+.agent-step-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  min-width: 0;
+}
+
+.agent-step-no {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.agent-step-intent {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-step-state {
+  flex: 0 0 auto;
+  font-size: 11.5px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--panel-3);
+  color: var(--text-3);
+}
+
+.agent-step-state.st-running {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.agent-step-state.st-done {
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.agent-step-state.st-failed,
+.agent-step-state.st-denied {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.agent-step-state.st-confirming {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.agent-step-think {
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.agent-step .agent-pre {
+  margin: 0;
+}
+
+.agent-tool-output {
+  margin: 0;
+  max-height: 260px;
+  overflow: auto;
+  background: #131a2c;
+  color: #dbe3f5;
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.agent-rc-bad {
+  color: var(--red);
+}
+
+.agent-final {
+  border-top: 1px dashed var(--border);
+  padding-top: 9px;
+  font-size: 12.8px;
+  line-height: 1.75;
+  color: var(--text);
+}
+
+.agent-final > b {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--accent);
+  font-size: 12.5px;
+}
+
+.agent-terminal-hint {
+  font-size: 12px;
+  margin-right: 4px;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------- Agent 多轮时间线 */
+
+.agent-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.agent-run-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  padding: 12px 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.agent-run-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.agent-run-head b {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.agent-run-text {
+  font-size: 12.8px;
+  line-height: 1.75;
+  color: var(--text);
+  min-width: 0;
+}
+
+.agent-step {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: 9px;
+  padding: 9px 11px;
+  background: var(--panel-2);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.agent-step.st-pending {
+  border-left-color: var(--accent-2);
+}
+
+.agent-step.st-running {
+  border-left-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.agent-step.st-done {
+  border-left-color: var(--green);
+}
+
+.agent-step.st-failed,
+.agent-step.st-denied {
+  border-left-color: var(--red);
+}
+
+.agent-step.st-confirming {
+  border-left-color: var(--amber);
+  background: var(--amber-soft);
+}
+
+.agent-step-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  min-width: 0;
+}
+
+.agent-step-no {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.agent-step-intent {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-step-state {
+  flex: 0 0 auto;
+  font-size: 11.5px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--panel-3);
+  color: var(--text-3);
+}
+
+.agent-step-state.st-running {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.agent-step-state.st-done {
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.agent-step-state.st-failed,
+.agent-step-state.st-denied {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.agent-step-state.st-confirming {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.agent-step-think {
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.agent-step .agent-pre {
+  margin: 0;
+}
+
+.agent-tool-output {
+  margin: 0;
+  max-height: 260px;
+  overflow: auto;
+  background: #131a2c;
+  color: #dbe3f5;
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.agent-rc-bad {
+  color: var(--red);
+}
+
+.agent-final {
+  border-top: 1px dashed var(--border);
+  padding-top: 9px;
+  font-size: 12.8px;
+  line-height: 1.75;
+  color: var(--text);
+}
+
+.agent-final > b {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--accent);
+  font-size: 12.5px;
+}
+
+.agent-terminal-hint {
+  font-size: 12px;
+  margin-right: 4px;
+  white-space: nowrap;
+}

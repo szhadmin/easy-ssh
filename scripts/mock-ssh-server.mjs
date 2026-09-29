@@ -98,7 +98,102 @@ const EXEC_FIXTURES = [
   [/ps -eo comm/, () => 'systemd\nsshd\njava\nnginx\n'],
   [/\/etc\/hosts/, () => 'localhost\t127.0.0.1\ngateway\t192.168.1.1\ndb-prod\t10.0.0.8\n'],
   [/for-each-ref/, () => 'main\nfeature/pay\nrelease/1.2\n'],
-  [/git -C .* remote/, () => 'origin\nupstream\n']
+  [/git -C .* remote/, () => 'origin\nupstream\n'],
+
+  /* ---------------------------------------------- 系统信息 / 指标采集脚本
+   *
+   * 这两支脚本以前 Mock 没实现，于是「认证成功但探测全空」也能一路绿 —— 
+   * 正好掩盖了「连不上却报已连接」这类假成功。这里照真实 Linux 的输出补上，
+   * 让「连接成功」必须伴随真实探测数据。
+   */
+  [
+    /@@HOSTNAME/,
+    () =>
+      [
+        '@@HOSTNAME',
+        'shizhenhuang-prod',
+        '@@OS',
+        'Ubuntu 22.04.4 LTS',
+        '@@KERNEL',
+        '5.15.0-105-generic',
+        '@@ARCH',
+        'x86_64',
+        '@@HOME',
+        '/root',
+        '@@ROOT',
+        '0',
+        '@@CPU',
+        'Intel(R) Xeon(R) Platinum 8255C CPU @ 2.50GHz',
+        '@@CORES',
+        '4',
+        '@@MEMTOTAL',
+        '7999788',
+        '@@UPTIME',
+        '1234567.89',
+        '@@DOCKER',
+        '24.0.7',
+        '@@END'
+      ].join('\n')
+  ],
+  [
+    /@@LOAD/,
+    () =>
+      [
+        '@@LOAD',
+        '0.42 0.35 0.30 1/412 987654',
+        '@@UPTIME',
+        '1234567.89 9876543.21',
+        '@@CPU',
+        'cpu  1234567 1234 456789 98765432 5678 0 9876 0 0 0',
+        '@@MEM',
+        'MemTotal:        7999788 kB',
+        'MemFree:         1234567 kB',
+        'MemAvailable:    3456789 kB',
+        'Buffers:          123456 kB',
+        'Cached:          1234567 kB',
+        'SwapTotal:       2097148 kB',
+        'SwapFree:        2097148 kB',
+        'Shmem:             12345 kB',
+        '@@CORES',
+        '4',
+        '@@MODEL',
+        'Intel(R) Xeon(R) Platinum 8255C CPU @ 2.50GHz',
+        '@@NPROC',
+        '412',
+        '@@DISK',
+        '/dev/vda1      41922560 12345678 27456000  32% /',
+        'tmpfs            3999892        0   3999892   0% /dev/shm',
+        '@@NET',
+        '  eth0: 12345678 12345 0 0 0 0 0 0 9876543 9876 0 0 0 0 0 0',
+        '@@PROC',
+        '  PID USER     %CPU %MEM COMMAND',
+        '    1 root      0.0  0.2 /sbin/init',
+        ' 2140 root     12.7  8.4 /usr/bin/java -jar app.jar',
+        ' 3201 www-data  2.1  1.2 nginx: worker process',
+        '@@PROCM',
+        '  PID USER     %CPU %MEM COMMAND',
+        ' 2140 root     12.7  8.4 /usr/bin/java -jar app.jar',
+        '    1 root      0.0  0.2 /sbin/init',
+        '@@END'
+      ].join('\n')
+  ],
+  // 可用命令清单：真实机器上是 `ls -1 /bin /sbin ...` 汇总
+  [
+    /ls -1 "\$d"/,
+    () =>
+      [
+        'apt', 'awk', 'bash', 'cat', 'chmod', 'chown', 'cp', 'curl', 'cut', 'date',
+        'df', 'diff', 'docker', 'du', 'echo', 'find', 'free', 'grep', 'gzip', 'head',
+        'hostname', 'id', 'ifconfig', 'ip', 'journalctl', 'kill', 'less', 'ln', 'ls', 'lsblk',
+        'lsof', 'mkdir', 'mount', 'mv', 'netstat', 'nginx', 'nproc', 'ps', 'pwd', 'rm',
+        'rsync', 'sed', 'ss', 'ssh', 'sudo', 'systemctl', 'tail', 'tar', 'tee', 'top',
+        'touch', 'tr', 'uname', 'uniq', 'uptime', 'vim', 'wc', 'wget', 'which', 'xargs', 'zcat'
+      ].join('\n')
+  ],
+
+  // 连接后的存活探测：真实 shell 里 `echo` 一定会把参数回显，Mock 也要照做，
+  // 否则客户端会认定「认证成功但会话不可用」而拒绝把这次连接当成成功。
+  [/__es_ok__/, () => '__es_ok__']
 ]
 
 function fakeExec(command) {
@@ -342,14 +437,28 @@ const server = new Server({ hostKeys: [hostKey] }, (client) => {
             if (!line) continue
             got = true
 
-            // 终端 Agent 单步工具调用：模拟 shell 实际输出，并用 OSC 500 边界回传退出码。
+            // 终端 Agent 单步工具调用：模拟 shell 实际输出，并用**纯 ASCII 行标记**回传退出码。
             // 命令仍由同一 shell 通道接收，测试不会退化成隐藏 exec。
-            const agent = /EASYSSH_AGENT:([^:']+):START/.exec(line)
+            //
+            // 为什么不是 OSC：哨兵要拼进「键入的命令行」，而 ESC 是 readline 的 meta 前缀，
+            // 会被连同后一个字符一起吞掉 —— 真实 bash 下标记根本打印不出来，Agent 只能干等到超时。
+            const agent = /__EASYSSH_AGENT_([A-Z2-9]{4,32})_START__/.exec(line)
             if (agent) {
-              const runId = agent[1]
+              const token = agent[1]
               const cmd = /\{\s*([\s\S]*?);\s*\};\s*__easyssh_rc/.exec(line)?.[1] || ''
-              const output = fakeExec(cmd) || (cmd.includes('df -h') ? 'Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        50G   43G  7G  87% /\n' : `mock executed: ${cmd}\n`)
-              ch.write(`\u001b]500;EASYSSH_AGENT:${runId}:START\u0007${output}\u001b]500;EASYSSH_AGENT:${runId}:END:0\u0007`)
+              const output =
+                fakeExec(cmd) ||
+                (cmd.includes('df -h')
+                  ? 'Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        50G   43G  7G  87% /\n'
+                  : cmd.includes('docker ps -a')
+                    ? // 刻意带上 ANSI 颜色：真机 docker 默认带色，用来验证回灌前会被剥掉
+                      '\u001b[1mCONTAINER ID\u001b[0m   IMAGE                STATUS\nabc123def456   \u001b[34mnginx:latest\u001b[0m       Up 3 days\n'
+                    : cmd.includes('docker system df -v')
+                      ? '\u001b[1mImages space usage:\u001b[0m\nREPOSITORY   TAG      SIZE     SHARED\nnginx        latest   187MB    0B\n'
+                      : `mock executed: ${cmd}\n`)
+              ch.write(
+                `\n__EASYSSH_AGENT_${token}_START__\n${output}\n__EASYSSH_AGENT_${token}_END__0\n`
+              )
               log(`AGENT ${JSON.stringify(cmd)}`)
               continue
             }

@@ -255,62 +255,95 @@ export interface ReconnectProgress {
 
 /* --------------------------------------------------------------- AI 助手 */
 
-/** 一条对话消息（渲染层构造好，主进程原样透传给上游） */
-export interface AgentChatMessage {
-  role: 'system' | 'user' | 'assistant'
-  content: string
-}
-
 /** 终端 Agent 的执行权限：手动不执行；受限授权仅自动执行普通命令；完全信任包含敏感命令。 */
 export type AgentExecutionMode = 'manual' | 'guarded' | 'trusted'
 
+/** 一次终端调用的一个步骤 */
 export interface AgentToolStep {
   id: string
-  summary: string
+  /** 模型给出的这一步意图：这条命令想确认什么 */
+  intent: string
   command: string
-  status: 'pending' | 'confirming' | 'running' | 'done' | 'failed' | 'cancelled'
+  status: 'pending' | 'confirming' | 'running' | 'done' | 'failed' | 'denied' | 'cancelled'
+  /** 调用这条命令之前，模型本轮说给自己/用户的判断文字 */
+  thinking?: string
   output?: string
   exitCode?: number
 }
 
+/**
+ * 一轮完整的 Agent 任务。
+ * 时间线以「轮」为单位累积 —— 新一轮只追加，不再覆盖上一轮的展示。
+ */
 export interface AgentRunView {
   /** 一次任务的唯一标识，避免清空或重发后旧请求回写新界面。 */
   id: string
-  state: 'idle' | 'thinking' | 'confirming' | 'executing' | 'done' | 'error' | 'aborted'
+  state: 'thinking' | 'executing' | 'done' | 'error' | 'aborted'
   goal: string
-  /** 当前这一轮模型给出的可展示判断（不是原始思维链）。 */
+  /** 模型本轮累计的正文（分析、结论都在这里，逐字流式追加） */
+  text: string
+  /** 当前这一轮的可展示判断，用于顶部一行状态 */
   activity?: string
-  requestId?: string
+  /** 推理模型的思维链（deepseek-reasoner 之类才有），单独折叠展示 */
+  reasoning?: string
+  steps: AgentToolStep[]
   conclusion?: string
   error?: string
-  steps: AgentToolStep[]
+  createdAt: number
 }
 
-/** 一次流式对话请求 */
-export interface AgentChatRequest {
-  /** 渲染层生成的请求 ID：既用来把流式事件对上号，也用来中止 */
-  requestId: string
-  messages: AgentChatMessage[]
-  /** 覆盖已保存的连接参数（用于「配置里还没保存就想先试一下」） */
-  baseURL?: string
-  model?: string
-  temperature?: number
-  maxTokens?: number
+/** 启动一次 Agent 任务的入参 */
+export interface AgentRunRequest {
+  runId: string
+  profileId: string
+  goal: string
+  /** 选中的专家角色 id，主进程据此拼 system prompt */
+  roleId?: string
+  /** 角色补充提示词（用户在「模型配置」里自行改写的那部分） */
+  systemExtra?: string
+  /** 服务器环境上下文（开启「带服务器环境」时由渲染层拼好） */
+  context?: string
+  /** 覆盖默认的最大步数 */
+  maxSteps?: number
 }
 
-/** 主进程 -> 渲染进程的流式事件 */
-export type AgentStreamEvent =
-  | { requestId: string; type: 'delta'; text: string }
-  /** 推理模型的思维链增量（DeepSeek-R1 / QwQ 等），单独展示 */
-  | { requestId: string; type: 'reasoning'; text: string }
+/** 主进程 -> 渲染进程的 Agent 事件流 */
+export type AgentRunEvent =
+  | { runId: string; type: 'text'; text: string }
+  | { runId: string; type: 'reasoning'; text: string }
+  /** 模型请求执行一条命令（此刻命令尚未执行） */
+  | { runId: string; type: 'tool-call'; stepId: string; intent: string; command: string }
+  /** 一步结束：拿到终端回显与退出码，或被拒绝 / 命令非法未执行 */
   | {
-      requestId: string
-      type: 'done'
-      usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number }
-      elapsedMs?: number
+      runId: string
+      type: 'tool-done'
+      stepId: string
+      approved: boolean
+      output: string
+      exitCode: number
     }
-  | { requestId: string; type: 'error'; message: string }
-  | { requestId: string; type: 'aborted' }
+  | { runId: string; type: 'finish'; text: string; reason?: string }
+  | { runId: string; type: 'error'; message: string }
+  | { runId: string; type: 'aborted' }
+
+/** 主进程 -> 渲染层：请在当前可见的终端里执行这条命令 */
+export interface AgentToolExecRequest {
+  runId: string
+  stepId: string
+  profileId: string
+  intent: string
+  command: string
+}
+
+/** 渲染层 -> 主进程：这一步的执行结果 */
+export interface AgentToolExecReply {
+  /** 带上轮次标识，主进程可以直接定位挂起的那次等待 */
+  runId?: string
+  stepId: string
+  approved: boolean
+  output: string
+  exitCode: number
+}
 
 /** 配置的对外视图 —— 绝不包含明文 Key */
 export interface AgentConfigView {

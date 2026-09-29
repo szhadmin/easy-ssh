@@ -1,24 +1,31 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import type { ConnectionProfile } from '@shared/types'
+import type { AgentRunView, AgentToolStep, ConnectionProfile } from '@shared/types'
 import { AGENT_ROLES, findRole } from '@shared/agent-roles'
-import { useStore, type AgentMsg } from '../store'
+import { useStore } from '../store'
 import { Btn, Confirm, Icons, Spinner } from './ui'
 import { AgentSettings, isLocalEndpoint } from './AgentSettings'
 import { isDangerous } from '../lib/commands'
 import { cls } from '../lib/utils'
 
-export function AgentPanel({ profile, embedded = false }: { profile: ConnectionProfile; embedded?: boolean }): React.ReactElement {
-  const conv = useStore((s) => s.agentConvos[profile.id])
+/** 稳定引用：避免每次都造一个新数组，把 zustand 的选择器逼成死循环 */
+const NO_RUNS: AgentRunView[] = []
+
+export function AgentPanel({
+  profile,
+  embedded = false
+}: {
+  profile: ConnectionProfile
+  embedded?: boolean
+}): React.ReactElement {
+  const runs = useStore((s) => s.agentRuns[profile.id]) ?? NO_RUNS
   const config = useStore((s) => s.agentConfig)
   const configLoaded = useStore((s) => s.agentConfigLoaded)
   const agentContext = useStore((s) => s.agentContext)
   const setAgentContext = useStore((s) => s.setAgentContext)
   const agentExecutionMode = useStore((s) => s.agentExecutionMode)
   const setAgentExecutionMode = useStore((s) => s.setAgentExecutionMode)
-  const dispatchAgentRun = useStore((s) => s.agentRun)
-  const agentRuns = useStore((s) => s.agentRuns)
+  const agentRun = useStore((s) => s.agentRun)
   const agentConfirmStep = useStore((s) => s.agentConfirmStep)
-  const agentSend = useStore((s) => s.agentSend)
   const agentStop = useStore((s) => s.agentStop)
   const agentClear = useStore((s) => s.agentClear)
   const saveAgentConfig = useStore((s) => s.saveAgentConfig)
@@ -34,20 +41,17 @@ export function AgentPanel({ profile, embedded = false }: { profile: ConnectionP
 
   const roleId = config?.roleId ?? AGENT_ROLES[0].id
   const role = findRole(roleId)
-  const messages = conv?.messages ?? []
-  const streaming = !!conv?.streaming
   const needsKey = configLoaded && !!config && !config.hasKey && !isLocalEndpoint(config.baseURL)
   const noConfig = configLoaded && !config
-  const agentRun = agentRuns[profile.id]
-  const agentBusy = !!agentRun && ['thinking', 'executing', 'confirming'].includes(agentRun.state)
-  const canRestart = !!agentRun && !agentBusy && agentRun.goal.trim().length > 0
+
+  const busy = runs.some((r) => r.state === 'thinking' || r.state === 'executing')
 
   // 新内容进来时贴着底部滚（用户自己往上翻就不打扰他）
   useEffect(() => {
     const el = bodyRef.current
     if (!el || !stickToBottom.current) return
     el.scrollTop = el.scrollHeight
-  }, [messages, streaming])
+  }, [runs])
 
   const onScroll = (): void => {
     const el = bodyRef.current
@@ -57,9 +61,8 @@ export function AgentPanel({ profile, embedded = false }: { profile: ConnectionP
 
   const send = (text?: string): void => {
     const t = (text ?? input).trim()
-    if (!t || streaming || agentBusy) return
-    // 三种权限都走同一条“观察 → 单步执行 → 回传结果 → 再决策”循环；差别仅在每步是否需要确认。
-    void dispatchAgentRun(profile.id, t)
+    if (!t || busy) return
+    void agentRun(profile.id, t)
     setInput('')
     stickToBottom.current = true
   }
@@ -67,10 +70,10 @@ export function AgentPanel({ profile, embedded = false }: { profile: ConnectionP
   const insertToTerminal = (cmd: string): void => {
     injectTerm(profile.id, cmd)
     setTab('terminal')
-    toast('info', '已插入终端', '确认无误后按回车执行；多行命令已用 && 连接成一个整体')
+    toast('info', '已插入终端', '确认无误后按回车执行')
   }
 
-  /** 执行仍复用当前 xterm 关联的 PTY，命令回显和输出与手工执行完全一致。 */
+  /** 执行仍复用当前 xterm 关联的 PTY：回显与输出和手工执行完全一致 */
   const executeInTerminal = (cmd: string): void => {
     if (isDangerous(cmd)) {
       setPendingExec(cmd)
@@ -78,7 +81,7 @@ export function AgentPanel({ profile, embedded = false }: { profile: ConnectionP
     }
     injectTerm(profile.id, cmd, true)
     setTab('terminal')
-    toast('info', 'AI 命令已在终端执行', '输出会实时显示在终端；可用 Ctrl+C 中止')
+    toast('info', '命令已在终端执行', '输出会实时显示在终端；可用 Ctrl+C 中止')
   }
 
   const confirmExecute = (): void => {
@@ -89,8 +92,11 @@ export function AgentPanel({ profile, embedded = false }: { profile: ConnectionP
     setPendingExec(null)
   }
 
-  const doSwitchRole = (id: string): void => {
-    void saveAgentConfig({ roleId: id })
+  const mdProps = {
+    onInsert: insertToTerminal,
+    onExecute: executeInTerminal,
+    autoExecute: false,
+    canAutoExecute: false
   }
 
   return (
@@ -101,7 +107,7 @@ export function AgentPanel({ profile, embedded = false }: { profile: ConnectionP
           <select
             className="agent-role-select"
             value={roleId}
-            onChange={(e) => doSwitchRole(e.target.value)}
+            onChange={(e) => void saveAgentConfig({ roleId: e.target.value })}
             title="切换专家角色（会写进系统提示词）"
           >
             {AGENT_ROLES.map((r) => (
@@ -124,8 +130,10 @@ export function AgentPanel({ profile, embedded = false }: { profile: ConnectionP
         <select
           className="agent-role-select"
           value={agentExecutionMode}
-          onChange={(e) => setAgentExecutionMode(e.target.value as 'manual' | 'guarded' | 'trusted')}
-          title="Agent 每次只执行一条命令，等待终端结果后再决定下一步"
+          onChange={(e) =>
+            setAgentExecutionMode(e.target.value as 'manual' | 'guarded' | 'trusted')
+          }
+          title="Agent 每次只执行一条命令，等终端结果回来后再决定下一步"
         >
           <option value="manual">手动执行</option>
           <option value="guarded">受限授权</option>
@@ -136,16 +144,11 @@ export function AgentPanel({ profile, embedded = false }: { profile: ConnectionP
         <Btn size="sm" icon={<Icons.sliders size={13} />} onClick={() => setSettingsOpen(true)}>
           模型配置
         </Btn>
-        {canRestart ? (
-          <Btn size="sm" icon={<Icons.refresh size={13} />} onClick={() => void dispatchAgentRun(profile.id, agentRun.goal)}>
-            重新发送
-          </Btn>
-        ) : null}
         <Btn
           size="sm"
           icon={<Icons.trash size={13} />}
           onClick={() => agentClear(profile.id)}
-          disabled={!messages.length && !agentRun}
+          disabled={runs.length === 0}
         >
           清空对话
         </Btn>
@@ -168,8 +171,7 @@ export function AgentPanel({ profile, embedded = false }: { profile: ConnectionP
       ) : null}
 
       <div className="agent-body" ref={bodyRef} onScroll={onScroll}>
-        {agentRun ? <AgentRunCard run={agentRun} onConfirm={(approve) => agentConfirmStep(profile.id, approve)} /> : null}
-        {messages.length === 0 && !agentRun ? (
+        {runs.length === 0 ? (
           <div className="agent-intro">
             <div className="agent-intro-icon">
               <Icons.robot size={30} />
@@ -178,30 +180,30 @@ export function AgentPanel({ profile, embedded = false }: { profile: ConnectionP
             <p>{role.greeting}</p>
             <div className="agent-starters">
               {role.starters.map((s) => (
-                <button key={s} className="agent-starter" onClick={() => send(s)} disabled={streaming}>
+                <button key={s} className="agent-starter" onClick={() => send(s)} disabled={busy}>
                   <Icons.sparkles size={12} />
                   {s}
                 </button>
               ))}
             </div>
             <div className="agent-intro-tip">
-              回答里的 <span className="mono">bash</span> 代码块可以直接「插入终端」——
-              只填进命令行、不会自动回车，你确认后再执行。
+              Agent 会一步步来：每一步只发<b>一条</b>命令，在左侧终端执行，
+              拿到真实输出与退出码后再决定下一步。
             </div>
           </div>
         ) : (
-          messages.map((m, i) => (
-            <MessageRow
-              key={m.id}
-              msg={m}
-              streaming={streaming}
-              isLast={i === messages.length - 1}
-              elapsedMs={conv?.elapsedMs}
-              usage={conv?.usage}
-              onInsert={insertToTerminal}
-              onExecute={executeInTerminal}
-              autoExecute={false}
-            />
+          runs.map((r) => (
+            <div className="agent-turn" key={r.id}>
+              <div className="agent-msg user">
+                <div className="agent-bubble user">{r.goal}</div>
+              </div>
+              <RunCard
+                run={r}
+                mdProps={mdProps}
+                onConfirm={(approve) => agentConfirmStep(profile.id, approve)}
+                onRerun={() => void agentRun(profile.id, r.goal)}
+              />
+            </div>
           ))
         )}
       </div>
@@ -219,19 +221,14 @@ export function AgentPanel({ profile, embedded = false }: { profile: ConnectionP
               send()
             }
           }}
-          disabled={streaming || agentBusy}
+          disabled={busy}
         />
-        {streaming || agentBusy ? (
+        {busy ? (
           <Btn variant="danger" icon={<Icons.stop size={14} />} onClick={() => void agentStop(profile.id)}>
             停止
           </Btn>
         ) : (
-          <Btn
-            variant="primary"
-            icon={<Icons.send size={14} />}
-            onClick={() => send()}
-            disabled={!input.trim()}
-          >
+          <Btn variant="primary" icon={<Icons.send size={14} />} onClick={() => send()} disabled={!input.trim()}>
             发送
           </Btn>
         )}
@@ -240,13 +237,15 @@ export function AgentPanel({ profile, embedded = false }: { profile: ConnectionP
       {settingsOpen ? <AgentSettings onClose={() => setSettingsOpen(false)} /> : null}
       {pendingExec ? (
         <Confirm
-          title="确认执行 AI 建议的危险命令？"
+          title="确认执行这条危险命令？"
           danger
           confirmText="在终端执行"
           message={
             <>
               <p>这条命令会通过当前终端的真实 PTY 执行，回显和输出都会显示在终端中：</p>
-              <pre className="agent-pre"><code>{pendingExec}</code></pre>
+              <pre className="agent-pre">
+                <code>{pendingExec}</code>
+              </pre>
             </>
           }
           onCancel={() => setPendingExec(null)}
@@ -257,133 +256,158 @@ export function AgentPanel({ profile, embedded = false }: { profile: ConnectionP
   )
 }
 
-/* ------------------------------------------------------------- Agent 工具记录 */
+/* --------------------------------------------------------- 一轮任务的卡片 */
 
-function AgentRunCard({ run, onConfirm }: { run: import('@shared/types').AgentRunView; onConfirm: (approve: boolean) => void }): React.ReactElement {
-  const stateLabel: Record<typeof run.state, string> = {
-    idle: '待开始',
-    thinking: '正在思考',
-    confirming: '等待授权',
-    executing: '终端执行中',
-    done: '已完成',
-    error: '执行失败',
-    aborted: '已停止'
-  }
+type MdProps = {
+  onInsert: (cmd: string) => void
+  onExecute: (cmd: string) => void
+  autoExecute: boolean
+  canAutoExecute: boolean
+}
+
+const RUN_STATE_LABEL: Record<AgentRunView['state'], string> = {
+  thinking: '正在思考',
+  executing: '终端执行中',
+  done: '已完成',
+  error: '执行失败',
+  aborted: '已停止'
+}
+
+const STEP_STATE_LABEL: Record<AgentToolStep['status'], string> = {
+  pending: '待执行',
+  confirming: '等待授权',
+  running: '终端执行中',
+  done: '已完成',
+  failed: '执行失败',
+  denied: '已拒绝',
+  cancelled: '已取消'
+}
+
+function RunCard({
+  run,
+  mdProps,
+  onConfirm,
+  onRerun
+}: {
+  run: AgentRunView
+  mdProps: MdProps
+  onConfirm: (approve: boolean) => void
+  onRerun: () => void
+}): React.ReactElement {
+  const busy = run.state === 'thinking' || run.state === 'executing'
   return (
     <section className="agent-run-card">
-      <div className="agent-run-head"><Icons.robot size={14} /><b>终端 Agent</b><span className="chip">{stateLabel[run.state]}</span></div>
-      <div className="agent-run-goal">任务：{run.goal}</div>
-      {run.activity ? <div className="agent-thinking"><Spinner /><span>{run.activity}</span></div> : null}
-      {run.steps.map((step, i) => (
-        <details className="agent-tool-call" key={step.id} open>
-          <summary>第 {i + 1} 步 · {step.summary} · <b>{step.status}</b></summary>
-          <div className="muted" style={{ marginTop: 6, fontSize: 12 }}>Agent 判断后只调用这一条命令，并等待左侧终端返回。</div>
-          <pre className="agent-pre"><code>$ {step.command}</code></pre>
-          {step.status === 'running' ? <div className="agent-thinking"><Spinner /><span>命令正在左侧终端运行，等待结果…</span></div> : null}
-          {step.output !== undefined ? <><div className="muted" style={{ marginTop: 8, fontSize: 12 }}>终端返回</div><pre className="agent-tool-output"><code>{step.output || '(无输出)'}</code></pre></> : null}
-          {step.exitCode !== undefined ? <span className="muted">退出码：{step.exitCode}</span> : null}
-          {step.status === 'confirming' ? <div className="row" style={{ marginTop: 8 }}><Btn size="sm" variant="primary" onClick={() => onConfirm(true)}>执行此步骤</Btn><Btn size="sm" variant="ghost" onClick={() => onConfirm(false)}>停止 Agent</Btn></div> : null}
+      <div className="agent-run-head">
+        <Icons.robot size={14} />
+        <b>终端 Agent</b>
+        <span className="chip">{RUN_STATE_LABEL[run.state]}</span>
+        <span style={{ flex: 1 }} />
+        {!busy ? (
+          <Btn size="sm" variant="ghost" icon={<Icons.refresh size={12} />} onClick={onRerun}>
+            重新发送
+          </Btn>
+        ) : null}
+      </div>
+
+      {run.activity ? (
+        <div className="agent-thinking">
+          {busy ? <Spinner /> : null}
+          <span>{run.activity}</span>
+        </div>
+      ) : null}
+
+      {run.reasoning ? (
+        <details className="agent-reasoning">
+          <summary>模型推理过程（{run.reasoning.length} 字）</summary>
+          <div className="agent-reasoning-body">{run.reasoning}</div>
         </details>
+      ) : null}
+
+      {run.steps.map((step, i) => (
+        <StepBlock key={step.id} index={i} step={step} onConfirm={onConfirm} />
       ))}
-      {run.conclusion ? <div className="agent-final"><b>最终结论</b><MarkdownText text={run.conclusion} onInsert={() => {}} onExecute={() => {}} autoExecute={false} canAutoExecute={false} /></div> : null}
-      {run.error ? <div className="agent-msg-error"><Icons.warn size={14} />{run.error}</div> : null}
+
+      {/* 正在流式输出的正文：等模型调用下一步工具时会被收进那一步的「思考」里 */}
+      {run.text ? (
+        <div className="agent-run-text">
+          <MarkdownText text={run.text} {...mdProps} />
+        </div>
+      ) : null}
+
+      {run.conclusion ? (
+        <div className="agent-final">
+          <b>结论</b>
+          <MarkdownText text={run.conclusion} {...mdProps} />
+        </div>
+      ) : null}
+
+      {run.error ? (
+        <div className="agent-msg-error">
+          <Icons.warn size={14} />
+          {run.error}
+        </div>
+      ) : null}
     </section>
   )
 }
 
-/* --------------------------------------------------------------- 单条消息 */
-
-function MessageRow({
-  msg,
-  streaming,
-  isLast,
-  elapsedMs,
-  usage,
-  onInsert,
-  onExecute,
-  autoExecute
+function StepBlock({
+  index,
+  step,
+  onConfirm
 }: {
-  msg: AgentMsg
-  streaming: boolean
-  isLast: boolean
-  elapsedMs?: number
-  usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number }
-  onInsert: (cmd: string) => void
-  onExecute: (cmd: string) => void
-  autoExecute: boolean
+  index: number
+  step: AgentToolStep
+  onConfirm: (approve: boolean) => void
 }): React.ReactElement {
-  const [copied, setCopied] = useState(false)
-
-  if (msg.role === 'user') {
-    return (
-      <div className="agent-msg user">
-        <div className="agent-bubble user">{msg.content}</div>
-      </div>
-    )
-  }
-
-  const busy = streaming && isLast && !msg.error
-
-  const doCopy = async (): Promise<void> => {
-    try {
-      await navigator.clipboard.writeText(msg.content)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    } catch {
-      /* 剪贴板不可用就静默 */
-    }
-  }
-
   return (
-    <div className="agent-msg bot">
-      <div className="agent-avatar">
-        <Icons.robot size={14} />
+    <div className={cls('agent-step', `st-${step.status}`)}>
+      <div className="agent-step-head">
+        <span className="agent-step-no">第 {index + 1} 步</span>
+        <span className="agent-step-intent">{step.intent}</span>
+        <span className={cls('agent-step-state', `st-${step.status}`)}>
+          {STEP_STATE_LABEL[step.status]}
+        </span>
       </div>
-      <div className="agent-bubble bot">
-        {msg.reasoning ? (
-          <details className="agent-reasoning">
-            <summary>思考过程（{msg.reasoning.length} 字）</summary>
-            <div className="agent-reasoning-body">{msg.reasoning}</div>
-          </details>
-        ) : null}
 
-        {msg.content ? (
-          <MarkdownText
-            text={msg.content}
-            onInsert={onInsert}
-            onExecute={onExecute}
-            autoExecute={autoExecute}
-            canAutoExecute={isLast && !busy}
-          />
-        ) : busy ? (
-          <div className="agent-thinking">
-            <Spinner />
-            <span>正在思考…</span>
-          </div>
-        ) : null}
+      {step.thinking ? <div className="agent-step-think">{step.thinking}</div> : null}
 
-        {msg.error ? (
-          <div className="agent-msg-error">
-            <Icons.warn size={14} />
-            <span>{msg.error}</span>
-          </div>
-        ) : null}
+      <pre className="agent-pre">
+        <code>$ {step.command}</code>
+      </pre>
 
-        {!busy && (msg.content || msg.error) ? (
-          <div className="agent-msg-foot">
-            <button className="agent-mini" onClick={() => void doCopy()}>
-              {copied ? '已复制' : '复制全文'}
-            </button>
-            {isLast && elapsedMs ? (
-              <span className="muted">
-                {(elapsedMs / 1000).toFixed(1)}s
-                {usage?.completionTokens ? ` · 输出 ${usage.completionTokens} tokens` : ''}
-              </span>
-            ) : null}
-            {msg.aborted ? <span className="muted">已中止</span> : null}
+      {step.status === 'running' ? (
+        <div className="agent-thinking">
+          <Spinner />
+          <span>命令正在左侧终端运行，等待结果…</span>
+        </div>
+      ) : null}
+
+      {step.status === 'confirming' ? (
+        <div className="row" style={{ marginTop: 8 }}>
+          <Btn size="sm" variant="primary" onClick={() => onConfirm(true)}>
+            在终端执行
+          </Btn>
+          <Btn size="sm" variant="ghost" onClick={() => onConfirm(false)}>
+            拒绝并停止
+          </Btn>
+        </div>
+      ) : null}
+
+      {step.output !== undefined ? (
+        <>
+          <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>
+            终端返回
           </div>
-        ) : null}
-      </div>
+          <pre className="agent-tool-output">
+            <code>{step.output || '(无输出)'}</code>
+          </pre>
+        </>
+      ) : null}
+
+      {step.exitCode !== undefined ? (
+        <span className={cls('muted', step.exitCode !== 0 && 'agent-rc-bad')}>退出码：{step.exitCode}</span>
+      ) : null}
     </div>
   )
 }
@@ -443,14 +467,26 @@ function inline(text: string, keyPrefix: string): React.ReactNode[] {
     if (m.index > last) out.push(text.slice(last, m.index))
     const tok = m[0]
     if (tok.startsWith('`')) {
-      out.push(<code key={`${keyPrefix}c${k++}`} className="agent-inline-code">{tok.slice(1, -1)}</code>)
+      out.push(
+        <code key={`${keyPrefix}c${k++}`} className="agent-inline-code">
+          {tok.slice(1, -1)}
+        </code>
+      )
     } else if (tok.startsWith('**')) {
       out.push(<strong key={`${keyPrefix}b${k++}`}>{tok.slice(2, -2)}</strong>)
     } else if (tok.startsWith('~~')) {
       out.push(<del key={`${keyPrefix}s${k++}`}>{tok.slice(2, -2)}</del>)
     } else {
       const link = /^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/.exec(tok)
-      out.push(link ? <a key={`${keyPrefix}a${k++}`} href={link[2]} target="_blank" rel="noreferrer">{link[1]}</a> : tok)
+      out.push(
+        link ? (
+          <a key={`${keyPrefix}a${k++}`} href={link[2]} target="_blank" rel="noreferrer">
+            {link[1]}
+          </a>
+        ) : (
+          tok
+        )
+      )
     }
     last = m.index + tok.length
   }
@@ -595,7 +631,7 @@ function CodeBlock({
   const insertable = SHELLISH.test(lang) ? toInsertable(code) : null
   const executedRef = useRef<string | null>(null)
 
-  // 仅对“最新回复 + 流式结束”的普通 Shell 命令自动执行一次；历史消息和危险命令永不自动重跑。
+  // 仅对「最新回复 + 流式结束」的普通 Shell 命令自动执行一次；历史消息和危险命令永不自动重跑。
   useEffect(() => {
     if (!autoExecute || !canAutoExecute || !insertable || isDangerous(insertable)) return
     if (executedRef.current === insertable) return

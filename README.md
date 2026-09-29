@@ -116,12 +116,15 @@ Windows 桌面端的 SSH / SFTP / Docker 可视化管理工具。面向"不想�
 - **只认 OpenAI 兼容协议**，所以一套配置通吃：内置 DeepSeek / 通义千问（百炼兼容模式）/ 智谱 GLM / Moonshot / OpenAI / 本地 Ollama / 自定义网关（one-api、new-api 之类的中转也能填）
 - 配置项：`Base URL` + `API Key` + `模型名` + `temperature`；「测试连接」发一条最短请求，一次把**地址 / Key / 模型**三件事全验掉
 - **API Key 不落明文**：走和连接密码同一套 `safeStorage`（Windows DPAPI）加密，界面上只显示 `sk-a…3f9c` 这样的脱敏串；明文 Key 只存在于主进程内存，**不进渲染进程**
-- **流式输出**：SSE 逐字上屏，带「停止」按钮可随时中断；推理模型（DeepSeek-R1 / QwQ 等）的思维链会被单独识别并折叠展示，不混进正文
+- **流式输出**：逐字上屏，带「停止」按钮可随时中断；推理模型（DeepSeek-R1 / QwQ 等）的思维链会被单独识别并折叠展示，不混进正文
 - **自动带上服务器环境**：每次提问自动附上当前连接的系统 / 内核 / CPU / 内存 / Docker 版本 / 终端所在目录 / 最近一次采样，并明确告诉模型「可直接采信、不要反问」（开关可关）
 - **模型可自动获取**：模型配置里点「获取模型」会调用 OpenAI 兼容的 `GET /v1/models` 并提供下拉候选；部分中转服务未实现这个接口时仍可手动填写模型名
 - **系统提示词不对用户展示**：界面只保留「补充要求」供你填写环境约束；内置角色规则和实际拼接的系统提示词不会显示
 - **Markdown 渲染**：支持标题、列表、引用、代码块、行内代码、加粗、删除线、链接；不解析原始 HTML，避免模型输出注入界面
-- **终端 Agent 单步协作**：终端工具栏点「AI 助手」在右侧打开对话抽屉，左侧终端始终可见。执行模式分为「手动执行 / 受限授权 / 完全信任（高级）」：Agent 每轮只能提出一条 `bash` 工具调用，当前真实 PTY 执行后采集输出与退出码回传模型，模型才决定下一步或输出最终结论；不再解析一整段回复后批量执行代码块。命令回显、实时输出和 Ctrl+C 都与手工输入完全一致，不走后台 `ssh.exec`。完全信任模式会自主执行敏感步骤；其余模式对敏感操作保留确认
+- **终端 Agent 用原生 tool calling**（基于 [Vercel AI SDK](https://ai-sdk.dev) 的 `streamText` + `stopWhen`）：终端工具栏点「AI 助手」在右侧打开抽屉，左侧终端始终可见。执行模式分为「手动执行 / 受限授权 / 完全信任（高级）」。模型通过 `run_command({ intent, command })` 工具**一次只申请一条单行命令**，由当前真实 PTY 执行后把输出与退出码回传，模型才决定下一步或收尾 —— 不再解析一整段回复后批量执行代码块
+- **命令始终跑在你看得见的那个终端里**：命令由渲染层注入当前可见 PTY（不走后台 `ssh.exec`），回显、实时输出、`Ctrl+C` 都与手工输入一致。输出边界靠**纯 ASCII 行哨兵**标定（`__EASYSSH_AGENT_<token>_START__` / `_END__<code>`）—— 不能用 OSC，因为哨兵是拼进「键入的命令行」的，而 `ESC` 是 readline 的 meta 前缀会被连同后一字符一起吞掉，那样命令早就跑完了 Agent 却只能干等到超时
+- **一步多条命令会串行排队**：模型偶尔会在同一回合里一次给出两条命令。终端只有一个，多给的命令按顺序依次注入、一条跑完再跑下一条 —— 并发注入会让后一条把前一条的**输出边界**覆盖掉，表现就是「命令早跑完了，Agent 却一直显示等待终端结果」。回灌前还会剥掉终端输出的 ANSI 色码，免得 `[1m` 这类残渣既费 token 又干扰阅读
+- **多轮时间线**：每一轮任务是一个独立回合，新的对话**只追加、不覆盖**上一轮的展示；每轮里能看到「目标 → 每步的判断 / 命令 / 终端输出 / 退出码 → 结论」，可单独「重新发送」或整体「清空对话」
 - 上游错误翻译成人话：401 → Key 无效或过期、404 → 地址少了 `/v1`、429 → 限流/配额用尽、5xx → 上游异常，并附上服务商返回的原因
 
 ---
@@ -143,24 +146,25 @@ esay-ssh/
 ├── scripts/
 │   ├── make-icon.mjs                # 纯 Node 生成多尺寸 .ico，零依赖
 │   ├── check-integration.mjs        # 注入脚本自检（bash/sh 语法 + 真实 OSC 输出）
-│   ├── check-osc.mjs                # OSC 7 解析器自检（含各种分片切法，15 条用例）
+│   ├── check-osc.mjs                # OSC 7 解析器 + Agent 哨兵扫描器自检（36 条用例，覆盖分片切法 + ANSI 剥离）
 │   ├── check-complete.cjs           # 补全引擎自检（88 条用例，纯逻辑、不起 Electron）
-│   ├── check-channels.cjs           # SSH 通道泄漏回归（28 条断言，含"旧写法必然被拒"的灵敏度自检）
-│   ├── check-agent.cjs              # AI 助手回归（34 条断言，配一个假 OpenAI 兼容服务）
+│   ├── check-channels.cjs           # SSH 通道泄漏回归（37 条断言，含"旧写法必然被拒"的灵敏度自检）
+│   ├── check-agent.cjs              # AI 助手回归（65 条断言，配一个假 OpenAI 兼容服务 + 自建反向桥）
 │   ├── tsconfig.check.json          # 补全自检的 TS→CJS 编译配置
 │   ├── tsconfig.ssh.json            # ssh-manager 自检的 TS→CJS 编译配置
-│   ├── tsconfig.agent.json          # agent.ts 自检的 TS→CJS 编译配置
+│   ├── tsconfig.agent.json          # agent.ts / agent-bridge.ts 自检的 TS→CJS 编译配置
 │   ├── mock-ssh-server.mjs          # 本地 Mock SSH（pty 回显 + 内存 SFTP + MaxSessions 模拟 + 统计/杀连接端口）
 │   ├── smoke-cwd-sync.js            # 端到端冒烟（注入 → 目录同步 → 分栏断言）
 │   ├── smoke-completion.js          # 端到端冒烟（真实远端数据 → 补全链路 + 面板断言）
 │   ├── smoke-channels.js            # 端到端冒烟（40 次文件操作 + 终端存活 + 通道计数）
-│   ├── smoke-agent.js               # 端到端冒烟（AI 面板 → 流式对话 → 插入终端）
+│   ├── smoke-agent.js               # 端到端冒烟（AI 面板 → 工具调用 → 可见 PTY 执行 → 多轮时间线）
 │   ├── check-channels-ui.cjs        # 用打包产物跑通道冒烟并核对 Mock 统计（12 条断言）
-│   └── check-agent-ui.cjs           # 用打包产物 + 假 LLM 跑 AI 助手全链路（33 条断言）
+│   └── check-agent-ui.cjs           # 用打包产物 + 假 LLM 跑终端 Agent 全链路（81 条断言，含一步多命令）
 ├── src/
 │   ├── shared/                      # 主/渲染进程共用
 │   │   ├── types.ts                 # 数据模型
 │   │   ├── agent-roles.ts           # AI 角色模板（6 个专家人设）+ 供应商预设
+│   │   ├── agent-tools.ts           # 终端 Agent 的公共约定：工具名、命令校验、ASCII 哨兵、输出截断
 │   │   ├── channels.ts              # IPC 通道名 + 事件名
 │   │   └── api.ts                   # window.api 类型契约
 │   ├── main/                        # 主进程（Node 侧，持有 SSH 连接）
@@ -171,7 +175,8 @@ esay-ssh/
 │   │   ├── monitor.ts               # /proc 指标采集与解析
 │   │   ├── docker.ts                # docker CLI 封装
 │   │   ├── complete.ts              # 补全的动态数据源（容器名 / 服务名 / 用户 / 分支 … 带缓存）
-│   │   ├── agent.ts                 # AI 助手：配置存储 + OpenAI 兼容流式对话（SSE）
+│   │   ├── agent.ts                 # 终端 Agent：配置存储 + Vercel AI SDK 工具调用循环（streamText + stopWhen）
+│   │   ├── agent-bridge.ts          # 工具执行的反向通道：主进程 ↔ 渲染层可见 PTY（挂起等待 + 超时兜底）
 │   │   └── store.ts                 # 连接配置 + safeStorage 凭据加密
 │   ├── preload/
 │   │   ├── index.ts                 # contextBridge 暴露 window.api
@@ -184,7 +189,7 @@ esay-ssh/
 │           ├── styles.css           # 全量样式（浅色主题）
 │           ├── lib/
 │           │   ├── utils.ts         # 格式化、路径、权限位等
-│           │   ├── osc.ts           # OSC 7 解析器（容忍网络分片切断）
+│           │   ├── osc.ts           # OSC 7 解析器 + Agent 哨兵扫描器（都容忍网络分片切断）
 │           │   ├── complete.ts      # 上下文补全引擎（分词 → 命令规格表 → 光标处该补什么）
 │           │   └── commands.ts      # 命令词典（中文说明 + 危险标记）
 │           └── components/
@@ -195,7 +200,7 @@ esay-ssh/
 │               ├── TerminalPanel.tsx
 │               ├── FilesPanel.tsx   # 全宽 / 紧凑两种形态，含权限弹窗与 CodeMirror 编辑器
 │               ├── DockerPanel.tsx  # 含容器抽屉与容器内终端
-│               ├── AgentPanel.tsx   # AI 对话、Markdown、命令插入终端
+│               ├── AgentPanel.tsx   # 终端 Agent 时间线（多轮累积）、Markdown、授权确认
 │               └── AgentSettings.tsx # LLM 配置、角色提示词、连接测试
 └── out/                             # 构建产物（main / preload / renderer）
 ```
@@ -295,7 +300,7 @@ dist\win-unpacked\EasySSH.exe --user-data-dir=%CD%\.tmp-ud-c
 ### 5.4 纯逻辑自检（不需要启动 Electron）
 
 ```bash
-node scripts/check-osc.mjs           # OSC 7 解析器：15 条用例，覆盖各种分片切法
+node scripts/check-osc.mjs           # OSC 7 解析器 + Agent 哨兵扫描器：36 条用例，覆盖分片切法与 ANSI 剥离
 node scripts/check-integration.mjs   # 注入脚本：bash/sh 语法检查 + 真实 OSC 输出 + 状态机顺序
 # 注：这两个脚本读 .tmp-check/ 下的编译产物，需先执行
 #   npx tsc src/renderer/src/lib/osc.ts src/main/shell-integration.ts \
@@ -311,13 +316,20 @@ node scripts/check-complete.cjs          # === 88 passed, 0 failed ===
 # SSH 通道复用 / 自动重连纯逻辑回归：12 条 UI + Mock SSH 统计断言
 node scripts/check-channels-ui.cjs       # === 12 passed, 0 failed ===
 
-# AI 助手主进程逻辑：Key 加密、配置、探测、SSE、推理流、停止与错误翻译
+# 终端 Agent 主进程逻辑：Key 加密、配置、探测、原生 tool calling、反向桥、
+# 非法命令拦下、用户拒绝、步数上限、中止与错误翻译
 npx tsc -p scripts/tsconfig.agent.json
-node scripts/check-agent.cjs              # === 34 passed, 0 failed ===
+node scripts/check-agent.cjs              # === 65 passed, 0 failed ===
 
-# AI 助手全链路：真实打包产物 + Mock SSH + 假 OpenAI 兼容服务
-node scripts/check-agent-ui.cjs            # === 43 passed, 0 failed ===
+# 终端 Agent 全链路：真实打包产物 + Mock SSH + 假 OpenAI 兼容服务
+node scripts/check-agent-ui.cjs            # === 81 passed, 0 failed ===
 ```
+
+> ⚠️ `ai` / `@ai-sdk/openai-compatible` / `zod` 都是 **ESM-only** 包，而 Electron 33 内置的
+> Node 20.18 **不支持 `require(ESM)`**。所以这三个包必须放在 `devDependencies` 里，
+> 让 `electron-vite build` 把它们**打进主进程产物**；一旦挪回 `dependencies`，
+> `externalizeDepsPlugin` 会把它们留在外部，打包后启动时直接抛 `ERR_REQUIRE_ESM`
+> （表现是「窗口不出来、也没有任何日志」）。`ssh2` 是 CJS，保持 externalize 不动。
 
 > `check-channels-ui.cjs` 与 `check-agent-ui.cjs` 会启动本地 Mock 服务，并拉起
 > `dist/win-unpacked/EasySSH.exe`；运行前请先关闭已打开的 EasySSH 实例。

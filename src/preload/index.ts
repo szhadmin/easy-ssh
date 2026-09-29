@@ -1,7 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { CH, EV } from '@shared/channels'
 import type { EasySshApi } from '@shared/api'
-import type { AgentStreamEvent, TransferProgress } from '@shared/types'
+import type { AgentRunEvent, AgentToolExecRequest, TransferProgress } from '@shared/types'
 type Unsub = () => void
 
 function on<T>(channel: string, cb: (payload: T) => void): Unsub {
@@ -97,9 +97,12 @@ const api: EasySshApi = {
     setConfig: (patch: unknown, apiKey?: string) => ipcRenderer.invoke(CH.AGENT_CONFIG_SET, patch, apiKey),
     test: (override?: unknown) => ipcRenderer.invoke(CH.AGENT_CONFIG_TEST, override),
     models: (override?: unknown) => ipcRenderer.invoke(CH.AGENT_MODELS, override),
-    chat: (req: unknown) => ipcRenderer.invoke(CH.AGENT_CHAT, req),
-    abort: (requestId: string) => ipcRenderer.invoke(CH.AGENT_ABORT, requestId),
-    onEvent: (cb: (e: AgentStreamEvent) => void): Unsub => on(EV.AGENT_EVENT, cb)
+    run: (req: unknown) => ipcRenderer.invoke(CH.AGENT_RUN, req),
+    toolResult: (reply: unknown) => ipcRenderer.invoke(CH.AGENT_TOOL_RESULT, reply),
+    abort: (runId: string) => ipcRenderer.invoke(CH.AGENT_ABORT, runId),
+    onEvent: (cb: (e: AgentRunEvent) => void): Unsub => on(EV.AGENT_RUN_EVENT, cb),
+    /** 主进程请求在渲染层当前可见的终端里执行一条命令 */
+    onToolExec: (cb: (req: AgentToolExecRequest) => void): Unsub => on(EV.AGENT_TOOL_EXEC, cb)
   },
 
   app: {

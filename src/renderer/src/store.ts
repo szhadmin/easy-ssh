@@ -1,13 +1,13 @@
 import { create } from 'zustand'
 import type {
-  AgentChatMessage,
   AgentExecutionMode,
+  AgentRunEvent,
   AgentRunView,
+  AgentToolExecRequest,
   AgentToolStep,
   AgentConfigPatch,
   AgentConfigView,
   AgentProbeResult,
-  AgentStreamEvent,
   ConnStatus,
   ConnectionProfile,
   DockerDetect,
@@ -15,14 +15,15 @@ import type {
   ServerInfo,
   TransferProgress
 } from '@shared/types'
-import {
-  DEFAULT_ROLE_ID,
-  composeSystemPrompt,
-  findRole
-} from '@shared/agent-roles'
+import { DEFAULT_ROLE_ID } from '@shared/agent-roles'
 import { formatBytes, formatUptime, unwrap } from './lib/utils'
 import { isDangerous } from './lib/commands'
-import { MAX_AGENT_STEPS, parseAgentDecision, toolResultMessage, wrapAgentCommand } from './lib/agent-protocol'
+import {
+  MAX_AGENT_STEPS,
+  agentSentinelToken,
+  truncateAgentOutput,
+  wrapAgentCommand
+} from '@shared/agent-tools'
 import { createAgentResultScanner } from './lib/osc'
 
 export type WorkspaceTab = 'overview' | 'terminal' | 'files' | 'docker' | 'agent'
@@ -101,37 +102,53 @@ export interface MetricPoint {
 
 /* ------------------------------------------------------------- AI 助手会话 */
 
-export interface AgentMsg {
-  id: string
-  role: 'user' | 'assistant'
-  content: string
-  /** 推理模型吐的思维链，折叠展示 */
-  reasoning?: string
-  /** 出错时的原因（这条回复作废，不再进上下文） */
-  error?: string
-  /** 被用户中止 */
-  aborted?: boolean
-  createdAt: number
-}
+/**
+ * Agent 的时间线以「轮」为单位累积：每按一次发送就 append 一条，旧轮不再被覆盖。
+ * 这样右上角那一栏才真的像一段对话，而不是永远只显示最新一条。
+ */
 
-export interface AgentConv {
-  messages: AgentMsg[]
-  streaming: boolean
-  requestId: string | null
-  elapsedMs?: number
-  usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number }
-}
+/**
+ * 正在建立的 SSH 连接（profileId -> 那次 connect 的 promise）。
+ *
+ * 只靠 `statuses[id]` 做幂等是不够的：一旦有别的来源把状态改成 disconnected / error
+ * （比如上一条会话迟到的 close 事件），同一台服务器就会再发一次 connect，
+ * 于是「连上 → 被顶掉 → 再连上 → 再被顶掉」来回跳。这里用一个真正在途的锁兜住。
+ */
+const connectInflight = new Map<string, Promise<void>>()
 
-/** requestId -> profileId。流式事件只带 requestId，靠这张表找回是哪台服务器的会话 */
-const reqOwner = new Map<string, string>()
-
-/** Agent 单步执行的 PTY 结果等待器；终端数据同时进 xterm 与这里，绝不走隐藏 exec。 */
-const agentStepWaiters = new Map<string, (result: { output: string; exitCode: number }) => void>()
+/** Agent 单步执行的 PTY 结果等待器：key 是这一步的哨兵 token */
+const agentStepWaiters = new Map<string, (r: { output: string; exitCode: number }) => void>()
+/** 每台服务器同一时刻只会有一个在跑的 Agent 命令，扫描器按 profileId 存放 */
 const agentStepScanners = new Map<string, ReturnType<typeof createAgentResultScanner>>()
+/** 等待用户授权某一步（stepId -> 决议） */
 const agentConfirmWaiters = new Map<string, (approve: boolean) => void>()
 
-/** 端上下文最多回带多少条历史，避免 prompt 无限膨胀 */
-const AGENT_HISTORY_LIMIT = 24
+/** 单步命令的硬上限：超过就按超时处理，避免整轮任务永久挂住 */
+const AGENT_STEP_TIMEOUT_MS = 10 * 60 * 1000
+
+/**
+ * 每个终端同时只允许一条 Agent 命令在跑。
+ *
+ * 主进程侧已经有一道同源队列，这里是第二道保险：只要有任何入口绕过它（比如将来新增的
+ * 触发方式）直接调 execInTerminal，单槽扫描器就会被后一条命令覆盖，前一条永远等不到结果。
+ * 排队而不是并发注入，是「命令跑在用户眼前那个 PTY 里」这个设计的前提。
+ */
+const agentTermQueues = new Map<string, Promise<unknown>>()
+
+function runInAgentTermQueue<T>(profileId: string, job: () => Promise<T>): Promise<T> {
+  const prev = agentTermQueues.get(profileId) ?? Promise.resolve()
+  const run = prev.then(job, job)
+  agentTermQueues.set(
+    profileId,
+    run.then(
+      () => undefined,
+      () => undefined
+    )
+  )
+  return run
+}
+
+const RUN_ACTIVE_STATES: AgentRunView['state'][] = ['thinking', 'executing']
 
 interface State {
   ready: boolean
@@ -153,10 +170,16 @@ interface State {
   termCwd: Record<string, string>
   /** 每次（重）连成功自增；终端面板据此重开一个 shell 通道 */
   connEpoch: Record<string, number>
-  /** AI 助手：每个连接一份对话 */
-  agentConvos: Record<string, AgentConv>
-  /** 终端 Agent：每台连接的单步执行状态 */
-  agentRuns: Record<string, AgentRunView>
+  /** 终端 Agent：每台连接一条时间线，按轮次累积，旧轮不再被覆盖 */
+  agentRuns: Record<string, AgentRunView[]>
+  /** 正在等用户授权的步骤：面板据此渲染确认条 */
+  agentPendingConfirm: {
+    runId: string
+    stepId: string
+    profileId: string
+    intent: string
+    command: string
+  } | null
   agentExecutionMode: AgentExecutionMode
   /** AI 助手：模型配置（不含明文 Key） */
   agentConfig: AgentConfigView | null
@@ -196,11 +219,16 @@ interface State {
   setAgentContext: (v: boolean) => void
   setAgentAutoExecute: (v: boolean) => void
   setAgentExecutionMode: (v: AgentExecutionMode) => void
-  agentSend: (profileId: string, text: string) => Promise<void>
   agentRun: (profileId: string, goal: string) => Promise<void>
+  /** 对某一步的授权决议；approve=false 会让 Agent 收到「用户拒绝」并自己收尾 */
   agentConfirmStep: (profileId: string, approve: boolean) => void
   agentStop: (profileId: string) => Promise<void>
+  /** 清空这台服务器的整条 Agent 时间线，并中止在途任务 */
   agentClear: (profileId: string) => void
+  /** 主进程推来的 Agent 事件（正文 / 推理 / 工具调用 / 结束） */
+  agentApplyEvent: (e: AgentRunEvent) => void
+  /** 主进程请求：在某台服务器当前可见的终端里执行一条命令，并把结果回传 */
+  agentHandleToolExec: (req: AgentToolExecRequest) => Promise<void>
   toast: (type: Toast['type'], title: string, message?: string) => void
   dismissToast: (id: string) => void
 }
@@ -254,7 +282,157 @@ function buildAgentContext(s: State, profileId: string): string {
   )
 }
 
-export const useStore = create<State>((set, get) => ({
+export const useStore = create<State>((set, get) => {
+  /* ------------------------------------------------ Agent 时间线的内部工具 */
+
+  /** 找出某个 runId 属于哪台服务器 */
+  function ownerOfRun(runId: string): string | null {
+    for (const [pid, list] of Object.entries(get().agentRuns)) {
+      if (list.some((r) => r.id === runId)) return pid
+    }
+    return null
+  }
+
+  /** 就地改写某一轮任务（不可变更新，避免 React 漏渲染） */
+  function patchRun(
+    profileId: string,
+    runId: string,
+    patch: Partial<AgentRunView> | ((r: AgentRunView) => Partial<AgentRunView>)
+  ): void {
+    set((s) => {
+      const list = s.agentRuns[profileId]
+      if (!list) return {}
+      const next = list.map((r) =>
+        r.id === runId ? { ...r, ...(typeof patch === 'function' ? patch(r) : patch) } : r
+      )
+      return { agentRuns: { ...s.agentRuns, [profileId]: next } }
+    })
+  }
+
+  /** 就地改写某一轮里的某一步 */
+  function patchStep(
+    profileId: string,
+    runId: string,
+    stepId: string,
+    patch: Partial<AgentToolStep>
+  ): void {
+    set((s) => {
+      const list = s.agentRuns[profileId]
+      if (!list) return {}
+      const next = list.map((r) =>
+        r.id === runId
+          ? { ...r, steps: r.steps.map((x) => (x.id === stepId ? { ...x, ...patch } : x)) }
+          : r
+      )
+      return { agentRuns: { ...s.agentRuns, [profileId]: next } }
+    })
+  }
+
+  /** 正文增量：追加到这一轮的正文缓冲，界面上就是逐字打出来的效果 */
+  function appendRunText(profileId: string, runId: string, chunk: string): void {
+    set((s) => {
+      const list = s.agentRuns[profileId]
+      if (!list) return {}
+      const next = list.map((r) => (r.id === runId ? { ...r, text: r.text + chunk } : r))
+      return { agentRuns: { ...s.agentRuns, [profileId]: next } }
+    })
+  }
+
+  /**
+   * 模型决定调用工具的那一刻，就是「思考」与「行动」的分界线：
+   * 把这一轮已经流出来的正文交给这一步当思考，同时新建步骤、清空缓冲。
+   * 这样界面上每一步都是「先看到判断，再看到命令」，而不是凭空冒出一条命令。
+   */
+  function commitThinking(
+    profileId: string,
+    runId: string,
+    stepId: string,
+    intent: string,
+    command: string
+  ): void {
+    set((s) => {
+      const list = s.agentRuns[profileId]
+      if (!list) return {}
+      const next = list.map((r) => {
+        if (r.id !== runId) return r
+        if (r.steps.some((x) => x.id === stepId)) return r
+        const step: AgentToolStep = {
+          id: stepId,
+          intent: intent || '执行命令',
+          command,
+          status: 'pending',
+          thinking: r.text.trim()
+        }
+        return { ...r, text: '', steps: [...r.steps, step], activity: `判断：${intent || command}` }
+      })
+      return { agentRuns: { ...s.agentRuns, [profileId]: next } }
+    })
+  }
+
+  /**
+   * 把一条命令送进当前可见的终端并等它跑完。
+   *
+   * 命令由 wrapAgentCommand 包上纯 ASCII 哨兵，扫描器从终端流里切出输出与退出码 ——
+   * 走的就是用户眼前那个 PTY，回显、实时输出、Ctrl+C 全都与手工执行一致。
+   * 哨兵只在命令真正跑完时才会打印，所以这里能立刻拿到结果，不再有 90 秒的假等待。
+   */
+  function execInTerminal(
+    profileId: string,
+    command: string
+  ): Promise<{ output: string; exitCode: number }> {
+    return runInAgentTermQueue(profileId, () => execInTerminalOnce(profileId, command))
+  }
+
+  function execInTerminalOnce(
+    profileId: string,
+    command: string
+  ): Promise<{ output: string; exitCode: number }> {
+    if (agentStepScanners.has(profileId)) {
+      // 队列保证不会走到这里；真出现就说明有别的入口绕过了 execInTerminal，
+      // 前一条命令的扫描器马上被覆盖、它会一直等到超时 —— 留个痕迹便于定位。
+      console.warn('[agent] 上一条命令还没结束就开始了新的一条，扫描器将被覆盖')
+    }
+    const token = agentSentinelToken()
+    agentStepScanners.set(profileId, createAgentResultScanner())
+    return new Promise<{ output: string; exitCode: number }>((resolve) => {
+      const finish = (r: { output: string; exitCode: number }): void => {
+        agentStepWaiters.delete(token)
+        clearTimeout(timer)
+        agentStepScanners.delete(profileId)
+        resolve(r)
+      }
+      const timer = setTimeout(
+        () =>
+          finish({
+            output: `命令在 ${Math.round(AGENT_STEP_TIMEOUT_MS / 60000)} 分钟内没有结束，已按超时处理。必要时点「停止」中止本轮任务。`,
+            exitCode: 124
+          }),
+        AGENT_STEP_TIMEOUT_MS
+      )
+      agentStepWaiters.set(token, finish)
+      get().injectTerm(profileId, wrapAgentCommand(command, token), true)
+    })
+  }
+
+  /** 把一步的结果回传给主进程；主进程正挂着等它 */
+  async function replyTool(
+    req: AgentToolExecRequest,
+    r: { approved: boolean; output: string; exitCode: number }
+  ): Promise<void> {
+    try {
+      await window.api.agent.toolResult({
+        runId: req.runId,
+        stepId: req.stepId,
+        approved: r.approved,
+        output: truncateAgentOutput(r.output ?? ''),
+        exitCode: r.exitCode
+      })
+    } catch {
+      /* 主进程可能已经不再等了（用户点了停止） */
+    }
+  }
+
+  return {
   ready: false,
   profiles: [],
   statuses: {},
@@ -270,8 +448,8 @@ export const useStore = create<State>((set, get) => ({
   remoteCommands: {},
   termCwd: {},
   connEpoch: {},
-  agentConvos: {},
   agentRuns: {},
+  agentPendingConfirm: null,
   agentExecutionMode: 'manual',
   agentConfig: null,
   agentConfigLoaded: false,
@@ -287,11 +465,10 @@ export const useStore = create<State>((set, get) => ({
       if (!scanner) return
       const result = scanner(packet.data)
       if (!result) return
-      const resolve = agentStepWaiters.get(result.runId)
-      if (resolve) {
-        agentStepWaiters.delete(result.runId)
-        resolve({ output: result.output, exitCode: result.exitCode })
-      }
+      const resolve = agentStepWaiters.get(result.token)
+      if (!resolve) return
+      agentStepWaiters.delete(result.token)
+      resolve({ output: result.output, exitCode: result.exitCode })
     })
 
     window.api.files.onProgress((p) => {
@@ -321,9 +498,18 @@ export const useStore = create<State>((set, get) => ({
     })
 
     window.api.files.onClosed((p) => {
+      const id = p.profileId
+      // 正在自动重连，或用户刚点了连接、握手还没回来：这次 close 只是过程，不是结论
+      if (get().statuses[id] === 'connecting') return
+      const err = get().errors[id] ?? ''
+      // 重连已经明确失败时，保留那条更准确的说明，只把状态定死为 error
+      if (err.startsWith('自动重连失败')) {
+        set((s) => ({ statuses: { ...s.statuses, [id]: 'error' } }))
+        return
+      }
       set((s) => ({
-        statuses: { ...s.statuses, [p.profileId]: 'disconnected' },
-        errors: { ...s.errors, [p.profileId]: '连接已断开' }
+        statuses: { ...s.statuses, [id]: 'disconnected' },
+        errors: { ...s.errors, [id]: '连接已断开' }
       }))
       get().toast('warn', '连接已断开', '远端关闭了 SSH 会话，请重新连接')
     })
@@ -357,62 +543,12 @@ export const useStore = create<State>((set, get) => ({
       get().toast('error', '自动重连失败', '网络或服务器仍不可达，请点「连接」手动重试')
     })
 
-    // AI 助手的流式增量：delta / reasoning 往当前回复上追加，done / error 收尾
-    window.api.agent.onEvent((e) => {
-      const profileId = reqOwner.get(e.requestId)
-      if (!profileId) return
+    // Agent 事件流：正文增量、工具调用、结束都由 agentApplyEvent 落到时间线上
+    window.api.agent.onEvent((e) => get().agentApplyEvent(e))
 
-      if (e.type === 'error') get().toast('error', 'AI 请求出错', e.message)
-
-      set((s) => {
-        const conv = s.agentConvos[profileId]
-        // 已经被清空 / 换了一轮对话，丢弃这条迟到的事件
-        if (!conv || conv.requestId !== e.requestId) return {}
-        const msgs = [...conv.messages]
-        const i = msgs.length - 1
-        if (i < 0) return {}
-        const last = msgs[i]
-
-        if (e.type === 'delta') {
-          msgs[i] = { ...last, content: last.content + e.text }
-          return { agentConvos: { ...s.agentConvos, [profileId]: { ...conv, messages: msgs } } }
-        }
-        if (e.type === 'reasoning') {
-          msgs[i] = { ...last, reasoning: (last.reasoning ?? '') + e.text }
-          return { agentConvos: { ...s.agentConvos, [profileId]: { ...conv, messages: msgs } } }
-        }
-
-        reqOwner.delete(e.requestId)
-        if (e.type === 'done') {
-          return {
-            agentConvos: {
-              ...s.agentConvos,
-              [profileId]: {
-                ...conv,
-                messages: msgs,
-                streaming: false,
-                requestId: null,
-                elapsedMs: e.elapsedMs,
-                usage: e.usage
-              }
-            }
-          }
-        }
-        if (e.type === 'error') {
-          msgs[i] = { ...last, error: e.message }
-        } else {
-          // aborted：已经吐出来的内容留着，没内容就标一句「已停止」
-          msgs[i] = last.content
-            ? { ...last, aborted: true }
-            : { ...last, aborted: true, error: '已停止生成' }
-        }
-        return {
-          agentConvos: {
-            ...s.agentConvos,
-            [profileId]: { ...conv, messages: msgs, streaming: false, requestId: null }
-          }
-        }
-      })
+    // 主进程的「请在这个终端里跑一条命令」请求：权限闸门 + 注入 PTY + 回传结果
+    window.api.agent.onToolExec((req) => {
+      void get().agentHandleToolExec(req)
     })
 
     void get().loadAgentConfig()
@@ -443,36 +579,52 @@ export const useStore = create<State>((set, get) => ({
   },
 
   async connect(id) {
-    // 幂等：正在连 / 已连上就直接返回。
-    // 否则「刚选中连接」的那一瞬间会有两个地方同时来连
-    //（Workspace 挂载时的自动连接 effect + setActive 里的 connect），
-    // 结果对同一台服务器建两条 SSH 连接、各跑一遍登录探路 —— 白占一条服务端会话。
+    // 幂等：同一条连接正在握手时，第二个请求直接并到同一次握手上。
+    // 只判断 statuses[id] 不够 —— 上一条会话迟到的 close 事件会把状态改回去，
+    // 于是「连上 → 被顶掉 → 再连上」来回跳；这里的在途锁才是真正的闸门。
+    const inflight = connectInflight.get(id)
+    if (inflight) return inflight
+
+    // 已经连着 / 正在连：不重复握手（除非明确要求重连）
     const cur = get().statuses[id]
     if (cur === 'connected' || cur === 'connecting') return
 
-    set((s) => ({
-      statuses: { ...s.statuses, [id]: 'connecting' },
-      errors: { ...s.errors, [id]: '' }
-    }))
-    try {
-      const res = await unwrap(window.api.ssh.connect(id))
+    const task = (async (): Promise<void> => {
       set((s) => ({
-        statuses: { ...s.statuses, [id]: 'connected' },
-        infos: res.info ? { ...s.infos, [id]: res.info } : s.infos,
-        docker: { ...s.docker, [id]: res.docker }
+        statuses: { ...s.statuses, [id]: 'connecting' },
+        errors: { ...s.errors, [id]: '' }
       }))
-      const name = get().profiles.find((p) => p.id === id)?.name ?? '服务器'
-      get().toast('success', `已连接：${name}`, res.info ? `${res.info.os} · ${res.info.arch} · 可用命令 ${res.commandCount} 个` : undefined)
-      void get().loadCommands(id)
-      void get().pollMetrics(id)
-    } catch (e) {
-      const msg = (e as Error).message
-      set((s) => ({
-        statuses: { ...s.statuses, [id]: 'error' },
-        errors: { ...s.errors, [id]: msg }
-      }))
-      get().toast('error', '连接失败', msg)
-    }
+      try {
+        const res = await unwrap(window.api.ssh.connect(id))
+        set((s) => ({
+          statuses: { ...s.statuses, [id]: 'connected' },
+          infos: res.info ? { ...s.infos, [id]: res.info } : s.infos,
+          docker: { ...s.docker, [id]: res.docker }
+        }))
+        const name = get().profiles.find((p) => p.id === id)?.name ?? '服务器'
+        // 探测结果里的空字段不要留在提示里（否则会出现「Linux ·  · 可用命令 31 个」这种读不通的文案）
+        const detail = res.info
+          ? [res.info.os, res.info.arch, res.commandCount > 0 ? `可用命令 ${res.commandCount} 个` : '']
+              .filter((x) => !!x && String(x).trim())
+              .join(' · ')
+          : ''
+        get().toast('success', `已连接：${name}`, detail || undefined)
+        void get().loadCommands(id)
+        void get().pollMetrics(id)
+      } catch (e) {
+        const msg = (e as Error).message
+        set((s) => ({
+          statuses: { ...s.statuses, [id]: 'error' },
+          errors: { ...s.errors, [id]: msg }
+        }))
+        get().toast('error', '连接失败', msg)
+      } finally {
+        connectInflight.delete(id)
+      }
+    })()
+
+    connectInflight.set(id, task)
+    return task
   },
 
   async disconnect(id) {
@@ -530,6 +682,9 @@ export const useStore = create<State>((set, get) => ({
     } catch (e) {
       // 采集失败往往是会话已断，避免刷屏
       const msg = (e as Error).message
+      // 正在自动重连 / 正在握手时，不要把状态改成 error —— 否则界面会从
+      // 「重连中」直接跳到失败页，把终端面板也一起卸载掉。
+      if (get().statuses[id] === 'connecting' || connectInflight.has(id)) return
       if (/断开|not connected|No response/i.test(msg)) {
         set((s) => ({ statuses: { ...s.statuses, [id]: 'error' }, errors: { ...s.errors, [id]: msg } }))
       }
@@ -619,235 +774,183 @@ export const useStore = create<State>((set, get) => ({
   },
 
   async agentRun(profileId, goal) {
-    const initial = get()
-    const previous = initial.agentRuns[profileId]
-    if (!goal.trim() || ['thinking', 'executing', 'confirming'].includes(previous?.state ?? '')) return
-    const restarting = !!previous && previous.goal === goal.trim()
-    const runKey = `task-${uid()}${uid()}`
-    const isCurrentRun = (): boolean => get().agentRuns[profileId]?.id === runKey
-    const roleId = initial.agentConfig?.roleId ?? DEFAULT_ROLE_ID
-    const role = findRole(roleId)
-    const protocol = `\n\n【终端 Agent 协议】\n你正在操作用户可见的真实终端。每轮只能二选一：\n1) 执行下一步：输出一行 STEP: <本步意图>，再输出且仅输出一个 bash fenced code block，里面必须是一条单行命令，禁止 &&、;、脚本或多条命令。然后等待工具结果。\n2) 结束：输出一行 STEP: <结论意图>，再输出一个 final fenced code block，面向用户说明证据、结论和建议。\n不要一次给多步方案；不要声称看到了尚未返回的命令结果；不要输出原始思维链。`
-    const baseSystem = `${composeSystemPrompt(role, initial.agentConfig?.prompts?.[roleId])}${protocol}`
-    const ctx = initial.agentContext ? buildAgentContext(initial, profileId) : ''
-    const messages: AgentChatMessage[] = [{ role: 'system', content: ctx ? `${baseSystem}\n\n${ctx}` : baseSystem }, { role: 'user', content: goal.trim() }]
-    set((s) => ({
-      agentRuns: { ...s.agentRuns, [profileId]: { id: runKey, state: 'thinking', activity: '正在分析目标，并决定第一条只读命令…', goal: goal.trim(), steps: [] } },
-      // Agent 任务也落一条用户消息：对话区不会因 messages 为空退回欢迎页，清空按钮也始终有可清的实体。
-      agentConvos: {
-        ...s.agentConvos,
-        [profileId]: {
-          ...(s.agentConvos[profileId] ?? { messages: [], streaming: false, requestId: null }),
-          messages: restarting
-            ? (s.agentConvos[profileId]?.messages ?? [])
-            : [...(s.agentConvos[profileId]?.messages ?? []), { id: uid(), role: 'user', content: goal.trim(), createdAt: Date.now() }],
-          streaming: false,
-          requestId: null
-        }
-      }
-    }))
+    const text = goal.trim()
+    if (!text) return
+    const st = get()
+    const timeline = st.agentRuns[profileId] ?? []
+    // 同一台服务器同一时刻只跑一轮：两条时间线交错着往同一个 PTY 里灌命令必然乱套
+    if (timeline.some((r) => RUN_ACTIVE_STATES.includes(r.state))) return
 
-    for (let n = 0; n < MAX_AGENT_STEPS; n++) {
-      if (!isCurrentRun()) return
-      const requestId = `agent-${uid()}${uid()}`
-      set((s) => ({ agentRuns: { ...s.agentRuns, [profileId]: { ...s.agentRuns[profileId], state: 'thinking', activity: n === 0 ? '正在制定第一步排查动作…' : '正在根据终端结果判断下一步…', requestId } } }))
-      const text = await new Promise<string>((resolve, reject) => {
-        let content = ''
-        reqOwner.set(requestId, profileId)
-        const off = window.api.agent.onEvent((event) => {
-          if (event.requestId !== requestId) return
-          if (event.type === 'delta') content += event.text
-          if (event.type === 'done') { off(); reqOwner.delete(requestId); resolve(content) }
-          if (event.type === 'error') { off(); reqOwner.delete(requestId); reject(new Error(event.message)) }
-          if (event.type === 'aborted') { off(); reqOwner.delete(requestId); reject(new Error('Agent 已停止')) }
+    const runId = `task-${uid()}${uid()}`
+    const roleId = st.agentConfig?.roleId ?? DEFAULT_ROLE_ID
+    const run: AgentRunView = {
+      id: runId,
+      state: 'thinking',
+      goal: text,
+      text: '',
+      activity: '正在分析目标，并决定第一条只读命令…',
+      steps: [],
+      createdAt: Date.now()
+    }
+    set((s) => ({ agentRuns: { ...s.agentRuns, [profileId]: [...(s.agentRuns[profileId] ?? []), run] } }))
+
+    try {
+      await unwrap(
+        window.api.agent.run({
+          runId,
+          profileId,
+          goal: text,
+          roleId,
+          systemExtra: st.agentConfig?.prompts?.[roleId],
+          context: st.agentContext ? buildAgentContext(st, profileId) : ''
         })
-        void window.api.agent.chat({ requestId, messages, baseURL: get().agentConfig?.baseURL, model: get().agentConfig?.model, temperature: get().agentConfig?.temperature })
-          .then((reply) => { if (!reply.ok) throw new Error(reply.error); return reply })
-          .catch((e) => { off(); reqOwner.delete(requestId); reject(e) })
-      }).catch((e) => {
-        if (isCurrentRun()) {
-          set((s) => ({ agentRuns: { ...s.agentRuns, [profileId]: { ...s.agentRuns[profileId], state: 'error', activity: '模型请求失败。', error: (e as Error).message } } }))
-        }
-        return ''
+      )
+    } catch (e) {
+      const msg = (e as Error).message
+      patchRun(profileId, runId, { state: 'error', activity: '任务没能启动。', error: msg })
+      get().toast('error', 'Agent 启动失败', msg)
+    }
+  },
+
+  agentApplyEvent(e) {
+    const profileId = ownerOfRun(e.runId)
+    if (!profileId) return
+    switch (e.type) {
+      case 'text':
+        appendRunText(profileId, e.runId, e.text)
+        break
+      case 'reasoning':
+        patchRun(profileId, e.runId, (r) => ({ reasoning: (r.reasoning ?? '') + e.text }))
+        break
+      case 'tool-call':
+        commitThinking(profileId, e.runId, e.stepId, e.intent, e.command)
+        break
+      case 'tool-done':
+        patchStep(profileId, e.runId, e.stepId, {
+          status: e.approved ? (e.exitCode === 0 ? 'done' : 'failed') : 'denied',
+          output: e.output,
+          exitCode: e.exitCode
+        })
+        patchRun(profileId, e.runId, {
+          state: 'thinking',
+          activity: `已收到终端结果（退出码 ${e.exitCode}），正在判断下一步…`
+        })
+        break
+      case 'finish':
+        patchRun(profileId, e.runId, (r) => ({
+          state: 'done',
+          conclusion: e.text || r.text.trim() || '任务结束，但模型没有给出文字结论。',
+          text: '',
+          activity: e.reason === 'tool-calls' ? '已达到步数上限，任务收尾。' : '已基于终端证据得出结论。'
+        }))
+        break
+      case 'error':
+        patchRun(profileId, e.runId, { state: 'error', activity: '执行中断。', error: e.message })
+        get().toast('error', 'Agent 出错', e.message)
+        break
+      case 'aborted':
+        patchRun(profileId, e.runId, { state: 'aborted', activity: '已停止。' })
+        break
+      default:
+        break
+    }
+  },
+
+  async agentHandleToolExec(req) {
+    const mode = get().agentExecutionMode
+    const dangerous = isDangerous(req.command)
+    // 手动：每一步都要点一下；受限：只有敏感命令才拦；完全信任：普通命令直接跑
+    const needsConfirm = mode === 'manual' || (mode === 'guarded' && dangerous)
+
+    if (needsConfirm) {
+      patchStep(req.profileId, req.runId, req.stepId, { status: 'confirming' })
+      patchRun(req.profileId, req.runId, {
+        state: 'thinking',
+        activity: `等待授权：${req.intent}`
       })
-      if (!isCurrentRun() || !text) return
-      messages.push({ role: 'assistant', content: text })
-      const decision = parseAgentDecision(text)
-      if (decision.kind === 'final') {
-        if (!isCurrentRun()) return
-        set((s) => ({ agentRuns: { ...s.agentRuns, [profileId]: { ...s.agentRuns[profileId], state: 'done', activity: '已基于终端证据得出结论。', conclusion: decision.final.conclusion } } }))
+      set({
+        agentPendingConfirm: {
+          runId: req.runId,
+          stepId: req.stepId,
+          profileId: req.profileId,
+          intent: req.intent,
+          command: req.command
+        }
+      })
+      const approved = await new Promise<boolean>((resolve) => {
+        agentConfirmWaiters.set(req.stepId, resolve)
+      })
+      set((s) => (s.agentPendingConfirm?.stepId === req.stepId ? { agentPendingConfirm: null } : {}))
+      if (!approved) {
+        patchStep(req.profileId, req.runId, req.stepId, { status: 'denied' })
+        await replyTool(req, {
+          approved: false,
+          output: '用户拒绝执行这条命令，它没有在终端里运行。',
+          exitCode: -1
+        })
         return
       }
-      const step: AgentToolStep = { id: uid(), summary: decision.action.summary, command: decision.action.command, status: 'pending' }
-      set((s) => ({ agentRuns: { ...s.agentRuns, [profileId]: { ...s.agentRuns[profileId], activity: `判断：${decision.action.summary}`, steps: [...s.agentRuns[profileId].steps, step] } } }))
-      const mode = get().agentExecutionMode
-      const needsConfirm = mode === 'manual' || (mode === 'guarded' && isDangerous(step.command))
-      if (needsConfirm) {
-        const approved = await new Promise<boolean>((resolve) => {
-          agentConfirmWaiters.set(profileId, resolve)
-          set((s) => ({ agentRuns: { ...s.agentRuns, [profileId]: { ...s.agentRuns[profileId], state: 'confirming', activity: `下一步需要授权：${decision.action.summary}`, steps: s.agentRuns[profileId].steps.map((x) => x.id === step.id ? { ...x, status: 'confirming' } : x) } } }))
-        })
-        if (!approved) {
-          if (!isCurrentRun()) return
-          set((s) => ({ agentRuns: { ...s.agentRuns, [profileId]: { ...s.agentRuns[profileId], state: 'aborted', activity: '用户拒绝执行该步骤，任务已停止。', steps: s.agentRuns[profileId].steps.map((x) => x.id === step.id ? { ...x, status: 'cancelled' } : x) } } }))
-          return
-        }
-      }
-      const runId = `run-${uid()}${uid()}`
-      const result = await new Promise<{ output: string; exitCode: number }>((resolve, reject) => {
-        const timer = setTimeout(() => { agentStepWaiters.delete(runId); reject(new Error('终端命令超过 90 秒未结束')) }, 90000)
-        agentStepWaiters.set(runId, (value) => { clearTimeout(timer); resolve(value) })
-        agentStepScanners.set(profileId, createAgentResultScanner())
-        set((s) => ({ agentRuns: { ...s.agentRuns, [profileId]: { ...s.agentRuns[profileId], state: 'executing', activity: `正在左侧终端执行：${decision.action.summary}`, steps: s.agentRuns[profileId].steps.map((x) => x.id === step.id ? { ...x, status: 'running' } : x) } } }))
-        get().injectTerm(profileId, wrapAgentCommand(step.command, runId), true)
-      }).catch((e) => ({ output: (e as Error).message, exitCode: 124 }))
-      agentStepScanners.delete(profileId)
-      if (!isCurrentRun()) return
-      set((s) => ({ agentRuns: { ...s.agentRuns, [profileId]: { ...s.agentRuns[profileId], state: 'thinking', activity: `已收到终端结果（退出码 ${result.exitCode}），正在判断下一步…`, steps: s.agentRuns[profileId].steps.map((x) => x.id === step.id ? { ...x, status: result.exitCode === 0 ? 'done' : 'failed', output: result.output, exitCode: result.exitCode } : x) } } }))
-      messages.push({ role: 'user', content: toolResultMessage(step.command, result.output, result.exitCode) })
     }
-    if (!isCurrentRun()) return
-    set((s) => ({ agentRuns: { ...s.agentRuns, [profileId]: { ...s.agentRuns[profileId], state: 'done', activity: '已达到安全步数上限。', conclusion: `已达到 ${MAX_AGENT_STEPS} 步上限，为避免无限执行，Agent 已停止。请根据已展示的工具结果继续判断。` } } }))
+
+    patchStep(req.profileId, req.runId, req.stepId, { status: 'running' })
+    patchRun(req.profileId, req.runId, {
+      state: 'executing',
+      activity: `正在左侧终端执行：${req.intent}`
+    })
+
+    const r = await execInTerminal(req.profileId, req.command)
+    patchStep(req.profileId, req.runId, req.stepId, {
+      status: r.exitCode === 0 ? 'done' : 'failed',
+      output: r.output,
+      exitCode: r.exitCode
+    })
+    await replyTool(req, { approved: true, output: r.output, exitCode: r.exitCode })
   },
 
   agentConfirmStep(profileId, approve) {
-    const resolve = agentConfirmWaiters.get(profileId)
-    if (!resolve) return
-    agentConfirmWaiters.delete(profileId)
-    resolve(approve)
-  },
-
-  async agentSend(profileId, text) {
-    const content = text.trim()
-    if (!content) return
-
-    const st = get()
-    const conv: AgentConv =
-      st.agentConvos[profileId] ?? { messages: [], streaming: false, requestId: null }
-    if (conv.streaming) return
-
-    const roleId = st.agentConfig?.roleId ?? DEFAULT_ROLE_ID
-    const role = findRole(roleId)
-    const executionPolicy = st.agentAutoExecute
-      ? '\n\n当前已开启“终端授权自动执行”。把需要执行的普通 Linux 命令放进标记为 bash 的 fenced code block；回复完成后客户端会经用户当前可见的终端执行。不要声称已经看到执行结果；等待用户贴出结果或继续提问。高风险破坏性命令仍须用户二次确认。'
-      : '\n\n当前为手动执行模式。可以给出 bash 代码块，但不要声称自己已执行；用户会自行选择是否在终端执行。'
-    const system = `${composeSystemPrompt(role, st.agentConfig?.prompts?.[roleId])}${executionPolicy}`
-
-    // 先按「上一轮为止的历史」重建干净的 messages（出错 / 空回复不进上下文）
-    const messages: AgentChatMessage[] = [{ role: 'system', content: system }]
-    for (const m of conv.messages.slice(-AGENT_HISTORY_LIMIT)) {
-      if (m.error) continue
-      if (m.role === 'assistant' && !m.content.trim()) continue
-      messages.push({ role: m.role, content: m.content })
-    }
-
-    const ctx = st.agentContext ? buildAgentContext(st, profileId) : ''
-    if (ctx) messages[0] = { role: 'system', content: `${system}\n\n${ctx}` }
-    messages.push({ role: 'user', content })
-
-    const requestId = `${uid()}${uid()}`
-    const userMsg: AgentMsg = { id: uid(), role: 'user', content, createdAt: Date.now() }
-    const botMsg: AgentMsg = { id: uid(), role: 'assistant', content: '', createdAt: Date.now() }
-
-    reqOwner.set(requestId, profileId)
-    set((s) => ({
-      agentConvos: {
-        ...s.agentConvos,
-        [profileId]: {
-          messages: [...conv.messages, userMsg, botMsg],
-          streaming: true,
-          requestId
-        }
-      }
-    }))
-
-    try {
-      const r = await unwrap(
-        window.api.agent.chat({
-          requestId,
-          messages,
-          baseURL: st.agentConfig?.baseURL,
-          model: st.agentConfig?.model,
-          temperature: st.agentConfig?.temperature
-        })
-      )
-      // 建连阶段就被中止了（比如点发送后立刻点停止）
-      if (!r.started) {
-        reqOwner.delete(requestId)
-        set((s) => {
-          const c = s.agentConvos[profileId]
-          if (!c || c.requestId !== requestId) return {}
-          return {
-            agentConvos: { ...s.agentConvos, [profileId]: { ...c, streaming: false, requestId: null } }
-          }
-        })
-      }
-    } catch (e) {
-      const msg = (e as Error).message
-      reqOwner.delete(requestId)
-      set((s) => {
-        const c = s.agentConvos[profileId]
-        if (!c) return {}
-        return {
-          agentConvos: {
-            ...s.agentConvos,
-            [profileId]: {
-              ...c,
-              streaming: false,
-              requestId: null,
-              messages: c.messages.map((m) => (m.id === botMsg.id ? { ...m, error: msg } : m))
-            }
-          }
-        }
-      })
-      get().toast('error', 'AI 请求失败', msg)
-    }
+    const pending = get().agentPendingConfirm
+    if (!pending || pending.profileId !== profileId) return
+    const resolve = agentConfirmWaiters.get(pending.stepId)
+    agentConfirmWaiters.delete(pending.stepId)
+    resolve?.(approve)
   },
 
   async agentStop(profileId) {
-    const conv = get().agentConvos[profileId]
-    const run = get().agentRuns[profileId]
-    const requestId = run?.requestId ?? conv?.requestId
-    const confirm = agentConfirmWaiters.get(profileId)
-    if (confirm) {
-      agentConfirmWaiters.delete(profileId)
-      confirm(false)
+    // 先放掉等待授权的步骤，否则主进程那侧会一直挂着
+    const pending = get().agentPendingConfirm
+    if (pending && pending.profileId === profileId) {
+      const resolve = agentConfirmWaiters.get(pending.stepId)
+      agentConfirmWaiters.delete(pending.stepId)
+      set({ agentPendingConfirm: null })
+      resolve?.(false)
     }
-    if (run && run.state !== 'done' && run.state !== 'error' && run.state !== 'aborted') {
-      set((s) => ({ agentRuns: { ...s.agentRuns, [profileId]: { ...run, state: 'aborted', activity: '用户已停止本次任务。' } } }))
-    }
-    if (!requestId) return
+    const timeline = get().agentRuns[profileId] ?? []
+    const active = timeline.find((r) => RUN_ACTIVE_STATES.includes(r.state))
+    if (!active) return
+    patchRun(profileId, active.id, { state: 'aborted', activity: '用户已停止本次任务。' })
     try {
-      await window.api.agent.abort(requestId)
+      await window.api.agent.abort(active.id)
     } catch {
-      /* 忽略：主进程那边可能已经结束了 */
+      /* 主进程那边可能已经结束了 */
     }
   },
 
   agentClear(profileId) {
-    const conv = get().agentConvos[profileId]
-    const run = get().agentRuns[profileId]
-    const requestId = run?.requestId ?? conv?.requestId
-    const confirm = agentConfirmWaiters.get(profileId)
-    if (confirm) {
-      agentConfirmWaiters.delete(profileId)
-      confirm(false)
+    const pending = get().agentPendingConfirm
+    if (pending && pending.profileId === profileId) {
+      const resolve = agentConfirmWaiters.get(pending.stepId)
+      agentConfirmWaiters.delete(pending.stepId)
+      set({ agentPendingConfirm: null })
+      resolve?.(false)
     }
-    if (requestId) {
-      void window.api.agent.abort(requestId)
-      reqOwner.delete(requestId)
-    }
+    const timeline = get().agentRuns[profileId] ?? []
+    const active = timeline.find((r) => RUN_ACTIVE_STATES.includes(r.state))
+    if (active) void window.api.agent.abort(active.id)
     agentStepScanners.delete(profileId)
     set((s) => {
-      const nextRuns = { ...s.agentRuns }
-      delete nextRuns[profileId]
-      return {
-        agentRuns: nextRuns,
-        agentConvos: {
-          ...s.agentConvos,
-          [profileId]: { messages: [], streaming: false, requestId: null }
-        }
-      }
+      const next = { ...s.agentRuns }
+      delete next[profileId]
+      return { agentRuns: next }
     })
   },
 
@@ -861,4 +964,5 @@ export const useStore = create<State>((set, get) => ({
   dismissToast(id) {
     set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }))
   }
-}))
+  }
+})

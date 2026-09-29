@@ -64,7 +64,10 @@ export const CH = {
   AGENT_CONFIG_SET: 'agent:configSet',
   AGENT_CONFIG_TEST: 'agent:configTest',
   AGENT_MODELS: 'agent:models',
-  AGENT_CHAT: 'agent:chat',
+  /** 启动一轮终端 Agent（主进程用 AI SDK 跑工具调用循环） */
+  AGENT_RUN: 'agent:run',
+  /** 渲染层回传某一步在可见终端里的执行结果 */
+  AGENT_TOOL_RESULT: 'agent:toolResult',
   AGENT_ABORT: 'agent:abort'
 } as const
 
@@ -76,8 +79,10 @@ export const EV = {
   CONN_CLOSED: 'evt:conn:closed',
   /** 意外掉线后的自动重连进度（scheduled / ok / failed） */
   CONN_RECONNECT: 'evt:conn:reconnect',
-  /** AI 助手的流式增量 */
-  AGENT_EVENT: 'evt:agent'
+  /** Agent 事件流（正文增量 / 工具调用 / 结束） */
+  AGENT_RUN_EVENT: 'evt:agent:run',
+  /** Agent 请求在渲染层当前可见的终端里执行一条命令 */
+  AGENT_TOOL_EXEC: 'evt:agent:toolExec'
 } as const
 
 export type ChannelName = (typeof CH)[keyof typeof CH]

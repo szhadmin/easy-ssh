@@ -3,12 +3,14 @@
  * preload 实现它，renderer 消费它 —— 一处定义，两端受检。
  */
 import type {
-  AgentChatRequest,
   AgentConfigPatch,
   AgentConfigView,
   AgentModelItem,
   AgentProbeResult,
-  AgentStreamEvent,
+  AgentRunEvent,
+  AgentRunRequest,
+  AgentToolExecReply,
+  AgentToolExecRequest,
   CommandHint,
   CompleteItem,
   CompSource,
@@ -137,7 +139,7 @@ export interface EasySshApi {
     exec(id: string, cid: string, cmd: string): Promise<IpcResult<string>>
   }
 
-  /** 内置 AI 助手：配置 LLM 并流式对话 */
+  /** 内置 AI 助手：配置 LLM，并在用户可见的终端里跑多步 Agent */
   agent: {
     getConfig(): Promise<IpcResult<AgentConfigView>>
     setConfig(patch: AgentConfigPatch, apiKey?: string): Promise<IpcResult<AgentConfigView>>
@@ -147,10 +149,15 @@ export interface EasySshApi {
     ): Promise<IpcResult<AgentProbeResult>>
     /** 从 OpenAI 兼容 GET /models 拉取模型列表；不支持时由界面保留手动填写 */
     models(override?: { baseURL?: string; apiKey?: string }): Promise<IpcResult<AgentModelItem[]>>
-    chat(req: AgentChatRequest): Promise<IpcResult<{ started: boolean }>>
-    abort(requestId: string): Promise<IpcResult<boolean>>
-    /** 流式增量（delta / reasoning / done / error / aborted） */
-    onEvent(cb: (e: AgentStreamEvent) => void): Unsub
+    /** 启动一轮 Agent：主进程用 AI SDK 跑工具调用循环 */
+    run(req: AgentRunRequest): Promise<IpcResult<{ started: boolean }>>
+    /** 回传某一步在可见终端里的执行结果 */
+    toolResult(reply: AgentToolExecReply): Promise<IpcResult<boolean>>
+    abort(runId: string): Promise<IpcResult<boolean>>
+    /** Agent 事件流（正文增量 / 工具调用 / 结束） */
+    onEvent(cb: (e: AgentRunEvent) => void): Unsub
+    /** 主进程请求在当前可见终端里执行一条命令 */
+    onToolExec(cb: (req: AgentToolExecRequest) => void): Unsub
   }
 
   app: {

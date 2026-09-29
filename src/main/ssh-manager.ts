@@ -66,6 +66,15 @@ export interface Session {
   secret?: ConnectionSecret
   /** 用户主动断开 / 切换连接时置位，用来区分「意外掉线」—— 主动断开不重连 */
   manualClose: boolean
+  /**
+   * 这条会话是被「新的连接请求」顶掉的（不是掉线，也不是用户点断开）。
+   *
+   * `connect()` 每次都会把旧会话 end 掉，旧 client 的 close 事件在时间上可能**晚于**
+   * 新连接的成功回包到达渲染层；如果不加区分地广播 CONN_CLOSED，界面就会在
+   * 「已连接」之后又被按回「连接已断开」，用户重试一次就再跳一轮 —— 看起来像连接
+   * 在反复断开，其实新会话一直是好的。
+   */
+  replaced: boolean
   /** 连续重连次数，连上一次就清零 */
   attempt: number
   /** 每次成功建立（含重连）自增；渲染层据此判断「终端要重开一个 shell」 */
@@ -110,13 +119,24 @@ export class SshManager {
   /* ------------------------------------------------------------ 连接 */
 
   async connect(profile: ConnectionProfile, secret?: ConnectionSecret): Promise<Client> {
-    // 先把上一条会话（若有）干净地收掉：置 manualClose 免得它触发自动重连
-    const prev = this.sessions.get(profile.id)
-    if (prev) {
-      prev.manualClose = true
-      if (prev.reconnectTimer) clearTimeout(prev.reconnectTimer)
+    const existing = this.sessions.get(profile.id)
+
+    // 幂等：已经有一条可用会话、且连接参数没变，直接复用。
+    // 这是「已连接 ↔ 连接已断开」来回跳的根治点 —— 以前无论旧会话是否健康都先拆掉，
+    // 拆掉的 close 事件又会把界面上刚建立的新连接按回失败状态。
+    if (existing && existing.ready && sameEndpoint(existing.profile, profile)) {
+      if (secret) existing.secret = secret
+      return existing.client
+    }
+
+    // 旧会话不健康 / 参数变了：干净收掉，并标记为「被替换」而不是「掉线」
+    if (existing) {
+      existing.replaced = true
+      if (existing.reconnectTimer) clearTimeout(existing.reconnectTimer)
+      existing.reconnectTimer = undefined
+      existing.reconnecting = false
       try {
-        prev.client.end()
+        existing.client.end()
       } catch {
         /* ignore */
       }
@@ -131,8 +151,9 @@ export class SshManager {
       ready: true,
       secret,
       manualClose: false,
+      replaced: false,
       attempt: 0,
-      epoch: 1,
+      epoch: (existing?.epoch ?? 0) + 1,
       reconnecting: false
     }
     this.wire(session)
@@ -218,8 +239,10 @@ export class SshManager {
       }
       this.dropSftp(profile.id)
 
+      if (session.replaced) return
       if (session.manualClose) {
-        this.emitClosed(profile.id)
+        // 只有「仍然是当前会话」的主动关闭才广播；被替换掉的旧会话一律不报。
+        if (this.sessions.get(profile.id) === session) this.emitClosed(profile.id)
         return
       }
       // 会话已经被替换掉（说明是重连过程中的旧连接）就不要再排队重连了
@@ -239,6 +262,8 @@ export class SshManager {
 
     if (session.attempt >= RECONNECT_DELAYS.length) {
       session.reconnecting = false
+      // 重试用尽 = 这条会话彻底没了。先广播「重连失败」（携带准确原因），
+      // 再广播 CONN_CLOSED（渲染层据此把状态定死为 error，并保留前一条更准确的文案）。
       this.emitReconnect(profileId, 'failed', session.attempt, 0, session.epoch)
       this.emitClosed(profileId)
       return
@@ -262,6 +287,8 @@ export class SshManager {
         ...session,
         client,
         ready: true,
+        replaced: false,
+        manualClose: false,
         attempt: 0,
         reconnecting: false,
         epoch: session.epoch + 1,
@@ -292,6 +319,8 @@ export class SshManager {
     const s = this.sessions.get(profileId)
     if (s) {
       s.manualClose = true
+      // 用户主动断开：即便 close 事件迟到，渲染层也不该收到「掉线」广播
+      s.replaced = true
       if (s.reconnectTimer) clearTimeout(s.reconnectTimer)
       s.reconnectTimer = undefined
       s.reconnecting = false
@@ -782,6 +811,20 @@ export class SshManager {
 }
 
 /* ------------------------------------------------------------------ 辅助 */
+
+/**
+ * 两条连接配置是否指向同一个「登录目标」。
+ * 只有目标没变时才允许复用已有会话；换了主机 / 端口 / 账号 / 认证方式必须重连。
+ */
+function sameEndpoint(a: ConnectionProfile, b: ConnectionProfile): boolean {
+  return (
+    a.host === b.host &&
+    (a.port || 22) === (b.port || 22) &&
+    a.username === b.username &&
+    a.authType === b.authType &&
+    (a.privateKeyPath ?? '') === (b.privateKeyPath ?? '')
+  )
+}
 
 export function formatBytes(n: number): string {
   if (!Number.isFinite(n) || n < 0) return '-'

@@ -14,5 +14,11 @@
     "baseUrl": "..",
     "paths": { "@shared/*": ["src/shared/*"] }
   },
-  "include": ["../src/main/agent.ts", "../src/shared/agent-roles.ts"]
+  "include": [
+    "../src/main/agent.ts",
+    "../src/main/agent-bridge.ts",
+    "../src/shared/agent-roles.ts",
+    "../src/shared/agent-tools.ts",
+    "../src/shared/types.ts"
+  ]
 }

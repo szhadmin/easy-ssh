@@ -4,7 +4,8 @@ import { join } from 'node:path'
 import { EV } from '@shared/channels'
 import { sshManager } from './ssh-manager'
 import { registerIpc } from './ipc'
-import { abortAll as abortAllAgentChats, setEventSink as setAgentEventSink } from './agent'
+import { abortAll as abortAllAgentRuns, setEventSink as setAgentEventSink } from './agent'
+import { setBridgeSender } from './agent-bridge'
 
 let mainWindow: BrowserWindow | null = null
 
@@ -137,8 +138,10 @@ app.whenReady().then(() => {
   sshManager.onClosed = (profileId) => broadcast(EV.CONN_CLOSED, { profileId })
   sshManager.onReconnect = (payload) => broadcast(EV.CONN_RECONNECT, payload)
 
-  // AI 助手的流式增量
-  setAgentEventSink((e) => broadcast(EV.AGENT_EVENT, e))
+  // AI 助手的 Agent 事件流
+  setAgentEventSink((e) => broadcast(EV.AGENT_RUN_EVENT, e))
+  // Agent 的工具执行要回落给渲染层：命令必须在用户眼前那个终端里跑
+  setBridgeSender((channel, payload) => broadcast(channel, payload))
 
   registerIpc(sshManager)
   createWindow()
@@ -150,11 +153,11 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   sshManager.disconnectAll()
-  abortAllAgentChats()
+  abortAllAgentRuns()
   if (process.platform !== 'darwin') app.quit()
 })
 
 app.on('before-quit', () => {
   sshManager.disconnectAll()
-  abortAllAgentChats()
+  abortAllAgentRuns()
 })

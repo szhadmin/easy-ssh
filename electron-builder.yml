@@ -3,8 +3,7 @@ productName: EasySSH
 copyright: Copyright © 2026 szhadmin
 
 directories:
-  # 旧 dist/win-unpacked 的 exe 被系统短暂占用时，改用独立输出目录避免阻塞新包。
-  output: release-1.0.2
+  output: dist
   buildResources: build
 
 # 只打包必需文件；renderer/main 已被 vite 打进 out/

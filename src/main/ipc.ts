@@ -4,7 +4,8 @@ import { basename, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { CH, EV } from '@shared/channels'
 import type {
-  AgentChatRequest,
+  AgentRunRequest,
+  AgentToolExecReply,
   AgentConfigPatch,
   ConnectionProfile,
   ConnectionSecret,
@@ -22,6 +23,7 @@ import * as store from './store'
 import * as monitor from './monitor'
 import * as docker from './docker'
 import * as agent from './agent'
+import { resolveToolExec } from './agent-bridge'
 import { clearCompleteCache, completeDynamic } from './complete'
 
 /* ------------------------------------------------------------------ 工具 */
@@ -235,6 +237,30 @@ export function registerIpc(ssh: SshManager): void {
     await ssh.connect(profile, secret)
     await store.touchProfile(id)
 
+    // 握手成功 ≠ 这条会话真能干活：受限 shell、跳板机、或刚被顶掉的旧连接，
+    // 都会出现「认证通过但 exec 一律返回空」的情况。以前这种情况会照报「已连接」，
+    // 还配一句「可用命令 31 个」（那其实是内建兜底表的条数），用户看到的成功是假的。
+    // 这里用一条最便宜的命令确认真能执行，拿不到回显就如实报错。
+    let alive = false
+    for (let attempt = 0; attempt < 2 && !alive; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 400))
+      try {
+        const probe = await ssh.exec(id, 'echo __es_ok__', 8000)
+        alive = probe.stdout.includes('__es_ok__')
+      } catch {
+        alive = false
+      }
+    }
+    if (!alive) {
+      monitor.clearCaches(id)
+      clearCompleteCache(id)
+      await ssh.disconnect(id)
+      throw new Error(
+        'SSH 认证已通过，但会话无法执行命令（远端返回为空）。' +
+          '常见原因：目标账号是受限 / 只读 shell，或服务端限制了会话数。请换一个账号或稍后重试。'
+      )
+    }
+
     // 登录后并行探路：系统信息 / 可用命令 / docker
     const [info, commandCount, dockerInfo] = await Promise.all([
       monitor.getServerInfo(id, true).catch(() => null),
@@ -424,10 +450,19 @@ export function registerIpc(ssh: SshManager): void {
 
   handle(CH.AGENT_MODELS, (override?: { baseURL?: string; apiKey?: string }) => agent.listModels(override))
 
-  /** 只等到「上游受理」，正文靠 EV.AGENT_EVENT 流式推回来 */
-  handle(CH.AGENT_CHAT, (req: AgentChatRequest) => agent.chat(req))
+  /**
+   * 启动一轮终端 Agent。只等到「已受理」，正文与工具调用通过
+   * EV.AGENT_RUN_EVENT 流式推回来。
+   */
+  handle(CH.AGENT_RUN, (req: AgentRunRequest) => agent.run(req))
 
-  handle(CH.AGENT_ABORT, (requestId: string) => agent.abort(requestId))
+  /** 渲染层回传某一步在可见终端里的执行结果（主进程正挂着等这个） */
+  handle(CH.AGENT_TOOL_RESULT, (reply: AgentToolExecReply) => {
+    resolveToolExec(reply)
+    return true
+  })
+
+  handle(CH.AGENT_ABORT, (runId: string) => agent.abort(runId))
 
   /* ---- 应用 ---- */
 

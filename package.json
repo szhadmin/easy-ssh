@@ -1,6 +1,6 @@
 {
   "name": "esay-ssh",
-  "version": "1.0.2",
+  "version": "1.0.5",
   "description": "Easy SSH - Windows 桌面 SSH / SFTP / Docker 可视化管理工具",
   "main": "./out/main/index.js",
   "author": "szhadmin <571545079@qq.com>",
@@ -37,6 +37,9 @@
     "ssh2": "^1.16.0"
   },
   "devDependencies": {
+    "@ai-sdk/openai-compatible": "^3.0.59",
+    "ai": "^7.0.122",
+    "zod": "^4.6.5",
     "@codemirror/commands": "^6.7.1",
     "@codemirror/lang-javascript": "^6.2.2",
     "@codemirror/lang-json": "^6.0.1",

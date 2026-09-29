@@ -145,6 +145,11 @@ async function main() {
   const reconnects = []
   mgr.onReconnect = (e) => reconnects.push(e)
 
+  // 连接被判定为「远端断开」时会走这里。界面上的「连接已断开」提示就来自它，
+  // 所以误报一次就会在日志里留下一次 —— 下面用它守住「不能误报」。
+  const closedEvents = []
+  mgr.onClosed = (id) => closedEvents.push(id)
+
   /* ------------------------------------------ ⓪ 报错文案（纯函数，不用连服务器） */
 
   // 用户看到的 `(SSH) Channel open failure: open failed` 就是 OpenSSH 在
@@ -333,6 +338,38 @@ async function main() {
   await sleep(2500)
   ok('主动断开不触发自动重连', reconnects.length === 0,
     reconnects.length ? JSON.stringify(reconnects) : '安静地断开')
+
+  /* ------------------------------- ⑧ 连接生命周期：不能误报「连接已断开」 */
+
+  // 用户看到的现象：界面反复「已连接 → 连接已断开」，像连接在不停掉线。
+  // 根因是重复连接时旧会话被顶掉，旧 client 的 close 事件晚于新连接的成功回包到达，
+  // 于是渲染层刚显示「已连接」又被按回失败页。这里锁住三条路径都不许广播断开。
+
+  closedEvents.length = 0
+  reconnects.length = 0
+  await mgr.connect(profile, { password: 'mock' })
+  ok('⑧-1 首次连接不广播断开', closedEvents.length === 0, JSON.stringify(closedEvents))
+  const client1 = mgr.get(profile.id).client
+
+  // 已经连着再连一次：必须幂等复用，而不是拆掉重建
+  await mgr.connect(profile, { password: 'mock' })
+  const client2 = mgr.get(profile.id).client
+  ok('⑧-2 已连接时重复 connect 复用同一会话', client1 === client2, client1 === client2 ? '同一 client' : '被重建了')
+  ok('⑧-3 重复 connect 不广播断开', closedEvents.length === 0, JSON.stringify(closedEvents))
+  ok('⑧-4 重复 connect 后仍然可用', mgr.isConnected(profile.id) && (await mgr.listDir(profile.id, '/var')).length === 6)
+
+  // 连接参数变了 → 必须真的替换会话，但替换同样不是「掉线」
+  await mgr.connect({ ...profile, username: 'ubuntu' }, { password: 'mock' })
+  const client3 = mgr.get(profile.id).client
+  ok('⑧-5 登录目标变化时确实重建会话', client3 !== client2)
+  ok('⑧-6 替换旧会话不广播断开（这就是界面来回跳的根因）', closedEvents.length === 0, JSON.stringify(closedEvents))
+  ok('⑧-7 替换后新会话可用', (await mgr.listDir(profile.id, '/var')).length === 6)
+  ok('⑧-8 替换不触发自动重连', reconnects.length === 0, JSON.stringify(reconnects))
+
+  // 用户主动断开：界面自己知道，不需要广播「远端关闭了 SSH 会话」
+  await mgr.disconnect(profile.id)
+  await sleep(400)
+  ok('⑧-9 主动断开不广播 CONN_CLOSED', closedEvents.length === 0, JSON.stringify(closedEvents))
 
   console.log(`\n=== ${passed} passed, ${failed} failed ===`)
   if (failed) console.log(`失败项：\n  - ${failures.join('\n  - ')}`)
