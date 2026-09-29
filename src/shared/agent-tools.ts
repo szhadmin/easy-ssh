@@ -17,6 +17,51 @@ export const MAX_AGENT_OUTPUT = 6000
 export const AGENT_TOOL_NAME = 'run_command'
 
 /**
+ * 结构化专用工具名。
+ *
+ * 为什么要给它们单开工具，而不是全都塞进 run_command：
+ *  - 参数化之后由**本地代码**拼命令，路径 / 容器名都过一遍 shq() 转义，
+ *    模型就没机会把 `; rm -rf /` 混进参数里（提示词约束不可靠，语法约束才可靠）。
+ *  - 每个工具对应一类固定意图，模型不必「回忆怎么写命令」，对新手更稳。
+ *  - 写操作（write_file）自带 dangerous 标记，直接进二次确认闸门。
+ */
+export const AGENT_TOOL_REMEMBER = 'remember'
+export const AGENT_TOOL_READ_FILE = 'read_file'
+export const AGENT_TOOL_LIST_DIR = 'list_dir'
+export const AGENT_TOOL_WRITE_FILE = 'write_file'
+export const AGENT_TOOL_DOCKER_PS = 'docker_ps'
+export const AGENT_TOOL_DOCKER_LOGS = 'docker_logs'
+export const AGENT_TOOL_SERVICE_STATUS = 'service_status'
+export const AGENT_TOOL_PROCESS_LIST = 'process_list'
+
+/** write_file 单次写入的字符上限（base64 后是单行命令，太长会把终端行撑爆） */
+export const AGENT_MAX_WRITE_CHARS = 16000
+
+/** 只读的结构化工具（不需要二次确认）；用于测试与文档 */
+export const AGENT_READONLY_TOOLS: readonly string[] = [
+  AGENT_TOOL_READ_FILE,
+  AGENT_TOOL_LIST_DIR,
+  AGENT_TOOL_DOCKER_PS,
+  AGENT_TOOL_DOCKER_LOGS,
+  AGENT_TOOL_SERVICE_STATUS,
+  AGENT_TOOL_PROCESS_LIST
+]
+
+/** 需要二次确认的结构化工具 */
+export const AGENT_WRITE_TOOLS: readonly string[] = [AGENT_TOOL_WRITE_FILE]
+
+/**
+ * POSIX shell 单引号转义：把任意字符串变成一个「纯字面量」参数。
+ *
+ * 单引号内除了 `'` 本身没有任何特殊字符，所以只要把 `'` 换成 `'\''`
+ * 就能安全嵌进 `cmd '...'` 里 —— 换行、`;`、`$()`、反引号全部失效。
+ * 结构化工具的用户可控参数（路径、容器名、服务名）都必须过这里。
+ */
+export function shq(value: string): string {
+  return `'${String(value ?? '').replace(/'/g, `'\\''`)}'`
+}
+
+/**
  * 只允许一个单行命令：拒绝多段脚本、控制字符与过长输入。
  * 返回 null 表示这条命令不被允许执行。
  */

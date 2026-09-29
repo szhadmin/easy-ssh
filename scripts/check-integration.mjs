@@ -42,10 +42,15 @@ console.log('写入次数:', writes.length)
 writes.forEach((w, i) => console.log(`  #${i} ${JSON.stringify(w)}`))
 console.log('done =', si.done)
 
-// 用户抢在注入前敲键 -> 应当完全不注入
+// 用户抢在注入前敲键 -> 先让一让，等他停手再补上（钩子脚本幂等，晚注入无副作用）
+let busyNow = true
 const writes2 = []
-const si2 = new ShellIntegration((d) => writes2.push(d), () => true)
+const si2 = new ShellIntegration((d) => writes2.push(d), () => busyNow)
 si2.onOutput()
 await wait(900)
-console.log('\n=== 用户已开始输入时 ===')
-console.log('写入次数:', writes2.length, '（期望 0）', 'done =', si2.done)
+console.log('\n=== 用户还在输入时 ===')
+console.log('写入次数:', writes2.length, '（期望 0，先不打扰他）', 'done =', si2.done)
+busyNow = false // 用户停手
+await wait(2600) // 等过一轮重试间隔（DEFER_MS = 2000）
+console.log('用户停手后写入次数:', writes2.length, '（期望 3）', 'done =', si2.done)
+writes2.forEach((w, i) => console.log(`  #${i} ${JSON.stringify(w).slice(0, 80)}`))

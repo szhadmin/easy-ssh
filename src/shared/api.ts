@@ -5,6 +5,7 @@
 import type {
   AgentConfigPatch,
   AgentConfigView,
+  AgentMemoryFact,
   AgentModelItem,
   AgentProbeResult,
   AgentRunEvent,
@@ -89,7 +90,12 @@ export interface EasySshApi {
 
   term: {
     open(args: TermOpenArgs): Promise<IpcResult<boolean>>
-    write(termId: string, data: string): Promise<IpcResult<boolean>>
+    /**
+     * 往终端写入数据。
+     * `internal = true` 表示程序注入（Agent 命令 / 补全插入 / 文件面板 cd），
+     * 不算「用户手敲键盘」—— 否则会打断远端目录钩子的注入。
+     */
+    write(termId: string, data: string, internal?: boolean): Promise<IpcResult<boolean>>
     resize(termId: string, cols: number, rows: number): Promise<IpcResult<boolean>>
     close(termId: string): Promise<IpcResult<boolean>>
     onData(cb: (p: { termId: string; data: string }) => void): Unsub
@@ -154,6 +160,15 @@ export interface EasySshApi {
     /** 回传某一步在可见终端里的执行结果 */
     toolResult(reply: AgentToolExecReply): Promise<IpcResult<boolean>>
     abort(runId: string): Promise<IpcResult<boolean>>
+    /** 长期记忆：列出这台服务器记下的全部事实 */
+    listMemory(profileId: string): Promise<IpcResult<AgentMemoryFact[]>>
+    /** 手动补一条；内容重复时 added=false，不会重复记 */
+    addMemory(
+      profileId: string,
+      text: string
+    ): Promise<IpcResult<{ facts: AgentMemoryFact[]; added: boolean; reason?: string }>>
+    removeMemory(profileId: string, id: string): Promise<IpcResult<AgentMemoryFact[]>>
+    clearMemory(profileId: string): Promise<IpcResult<AgentMemoryFact[]>>
     /** Agent 事件流（正文增量 / 工具调用 / 结束） */
     onEvent(cb: (e: AgentRunEvent) => void): Unsub
     /** 主进程请求在当前可见终端里执行一条命令 */

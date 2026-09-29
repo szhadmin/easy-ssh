@@ -231,8 +231,55 @@
   out.renderedTurns4 = document.querySelectorAll('.agent-turn').length
   out.renderedSteps4 = document.querySelectorAll('.agent-step').length
 
+  /* --------- ⑨ 结构化专用工具：read_file 必须由本地代码拼命令、参数已转义 --------- */
+
+  await store.getState().agentRun(id, '结构化工具验证：读一下 nginx 主配置')
+  const run5 = latestRun(id)
+  const done5 = run5 ? await waitRun(id, run5.id, 40000) : null
+  out.structState = done5 ? done5.state : null
+  const s5 = done5 && done5.steps[0] ? done5.steps[0] : null
+  out.structTool = s5 ? s5.tool : null
+  out.structCommand = s5 ? s5.command : null
+  out.structStatus = s5 ? s5.status : null
+  out.structExitCode = s5 ? s5.exitCode : null
+  out.structOutput = s5 ? (s5.output || '').slice(0, 80) : null
+  out.structDanger = s5 ? s5.danger === true : null
+  out.structConclusion = done5 ? done5.conclusion : null
+  out.structTerminalSawIt = termStream.includes('head -n 20')
+
+  await sleep(200)
+  out.renderedToolBadges5 = [...document.querySelectorAll('.agent-step .chip')].map((x) => x.textContent)
+
+  /* --------- ⑩ 跨会话长期记忆：模型用 remember 记下事实，界面与落盘都要有 --------- */
+
+  await store.getState().agentRun(id, '记忆验证：记住这台机器用 apt 管理软件包')
+  const run6 = latestRun(id)
+  const done6 = run6 ? await waitRun(id, run6.id, 40000) : null
+  out.memState = done6 ? done6.state : null
+  out.memConclusion = done6 ? done6.conclusion : null
+  // remember 不执行命令：这一轮不应该出现任何终端步骤
+  out.memStepCount = done6 ? done6.steps.length : -1
+
+  await store.getState().loadAgentMemory(id)
+  await sleep(200)
+  const memList = store.getState().agentMemory[id] || []
+  out.memCount = memList.length
+  out.memTexts = memList.map((f) => f.text)
+  out.memSource = memList.length ? memList[0].source : null
+
+  // 打开「模型配置」看记忆区块是否真的渲染出来
+  clickByText('.agent-bar .btn', '模型配置')
+  await sleep(300)
+  out.memItemsRendered = document.querySelectorAll('.agent-memory-item').length
+  out.memSectionText = document.querySelector('.agent-memory')
+    ? (document.querySelector('.agent-memory').textContent || '').slice(0, 60)
+    : null
+  window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+  await sleep(200)
+
   offTerm()
 
+  out.profileId = id
   out.finalStatus = store.getState().statuses[id]
   return out
 })()

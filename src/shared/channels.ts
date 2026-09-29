@@ -68,7 +68,12 @@ export const CH = {
   AGENT_RUN: 'agent:run',
   /** 渲染层回传某一步在可见终端里的执行结果 */
   AGENT_TOOL_RESULT: 'agent:toolResult',
-  AGENT_ABORT: 'agent:abort'
+  AGENT_ABORT: 'agent:abort',
+  /** 跨会话长期记忆：按服务器列出 / 新增 / 删除 / 清空 */
+  AGENT_MEMORY_LIST: 'agent:memoryList',
+  AGENT_MEMORY_ADD: 'agent:memoryAdd',
+  AGENT_MEMORY_REMOVE: 'agent:memoryRemove',
+  AGENT_MEMORY_CLEAR: 'agent:memoryClear'
 } as const
 
 /** 主进程 -> 渲染进程 的事件 */

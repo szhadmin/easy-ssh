@@ -1,9 +1,12 @@
 import React, { useEffect, useState } from 'react'
 import { AGENT_PRESETS, AGENT_ROLES, DEFAULT_ROLE_ID, findRole } from '@shared/agent-roles'
-import type { AgentModelItem } from '@shared/types'
+import type { AgentMemoryFact, AgentModelItem } from '@shared/types'
 import { Btn, Field, Icons, Modal } from './ui'
 import { useStore } from '../store'
 import { cls } from '../lib/utils'
+
+/** 稳定引用：避免每次造一个新数组，把 zustand 的选择器逼成死循环 */
+const NO_MEMORY: AgentMemoryFact[] = []
 
 /** 判断是不是本机地址（本地推理服务通常不校验 Key） */
 export function isLocalEndpoint(baseURL: string): boolean {
@@ -13,9 +16,12 @@ export function isLocalEndpoint(baseURL: string): boolean {
 }
 
 export function AgentSettings({
+  profileId,
   onClose,
   onSaved
 }: {
+  /** 当前服务器：长期记忆按服务器分开存，没有它就不显示记忆区块 */
+  profileId?: string
   onClose: () => void
   onSaved?: () => void
 }): React.ReactElement {
@@ -23,6 +29,11 @@ export function AgentSettings({
   const saveAgentConfig = useStore((s) => s.saveAgentConfig)
   const testAgentConfig = useStore((s) => s.testAgentConfig)
   const toast = useStore((s) => s.toast)
+  const memory = useStore((s) => (profileId ? s.agentMemory[profileId] : undefined)) ?? NO_MEMORY
+  const loadAgentMemory = useStore((s) => s.loadAgentMemory)
+  const addAgentMemory = useStore((s) => s.addAgentMemory)
+  const removeAgentMemory = useStore((s) => s.removeAgentMemory)
+  const clearAgentMemory = useStore((s) => s.clearAgentMemory)
 
   const [baseURL, setBaseURL] = useState(config?.baseURL ?? '')
   const [model, setModel] = useState(config?.model ?? '')
@@ -36,6 +47,12 @@ export function AgentSettings({
   const [loadingModels, setLoadingModels] = useState(false)
   const [models, setModels] = useState<AgentModelItem[]>([])
   const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null)
+  const [newFact, setNewFact] = useState('')
+
+  // 打开设置时把长期记忆拉进来，确保看到的是最新一份（模型记了新事实也会推事件更新）
+  useEffect(() => {
+    if (profileId) void loadAgentMemory(profileId)
+  }, [profileId, loadAgentMemory])
 
   // 配置是异步加载的，回来了再补一次初值（用户已经改过的输入会被下面的 dirty 判断保护）
   useEffect(() => {
@@ -279,6 +296,75 @@ export function AgentSettings({
           style={{ resize: 'vertical', lineHeight: 1.7 }}
         />
       </Field>
+
+      {profileId ? (
+        <Field
+          label={`长期记忆 · 这台服务器（${memory.length}/50）`}
+          hint="AI 在对话里主动「记住」的事实会自动出现在这里；关掉再打开应用仍然在。过时了就删掉。"
+        >
+          <div className="agent-memory">
+            {memory.length ? (
+              memory.map((f) => (
+                <div className="agent-memory-item" key={f.id}>
+                  <span className={cls('agent-memory-src', f.source === 'user' && 'user')}>
+                    {f.source === 'user' ? '我' : 'AI'}
+                  </span>
+                  <span className="agent-memory-text" title={f.text}>
+                    {f.text}
+                  </span>
+                  <button
+                    className="agent-memory-del"
+                    title="删除这条记忆"
+                    onClick={() => void removeAgentMemory(profileId, f.id)}
+                  >
+                    <Icons.close size={13} />
+                  </button>
+                </div>
+              ))
+            ) : (
+              <div className="agent-memory-empty">
+                还没有记忆。AI 回答里出现「记住……」时它会自动记下；你也可以在下面手动补一条。记忆只存在本机，按服务器分开。
+              </div>
+            )}
+          </div>
+          <div className="row" style={{ gap: 6, marginTop: 8 }}>
+            <input
+              className="input flex1"
+              value={newFact}
+              onChange={(e) => setNewFact(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && newFact.trim()) {
+                  void addAgentMemory(profileId, newFact.trim())
+                  setNewFact('')
+                }
+              }}
+              placeholder="手动补一条，例如：生产机禁止重启 nginx，只允许 reload"
+              maxLength={200}
+            />
+            <Btn
+              icon={<Icons.plus size={13} />}
+              disabled={!newFact.trim()}
+              onClick={() => {
+                const t = newFact.trim()
+                if (!t) return
+                void addAgentMemory(profileId, t)
+                setNewFact('')
+              }}
+            >
+              添加
+            </Btn>
+            {memory.length ? (
+              <Btn
+                icon={<Icons.trash size={14} />}
+                onClick={() => void clearAgentMemory(profileId)}
+                title="清空这台服务器的全部记忆"
+              >
+                清空
+              </Btn>
+            ) : null}
+          </div>
+        </Field>
+      ) : null}
 
       {testResult ? (
         <div className={`banner ${testResult.ok ? 'info' : 'error'}`} style={{ marginBottom: 0 }}>

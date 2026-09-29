@@ -41,6 +41,27 @@ const FREE_OUT = '              total        used        free      shared  buff/
 const DF_FINAL = '根分区已使用 87%，建议继续清理 /var/log。'
 const FREE_FINAL = '内存充足，可用约 2.1G，暂时不需要处理。'
 const DOCKER_FINAL = '容器只有 nginx 一个，镜像占用 187MB，空间不是问题。'
+/** 结构化工具轮：模型用 read_file 读配置，期望的本地拼命令 */
+const STRUCT_CMD = "head -n 20 -- '/etc/nginx/nginx.conf'"
+const STRUCT_FINAL = 'nginx 主配置里 worker_processes 是 auto，client_max_body_size 64m。'
+/** 记忆轮：模型用 remember 记下的长期事实 */
+const MEM_FACT = '这台机器用 apt 管理软件包，不是 yum'
+const MEM_FINAL = '已经记住了：这台机器用 apt 管理软件包。'
+/** 主进程应当注册的全部工具（1 个通用 + 7 个结构化 + 1 个记忆） */
+const ALL_TOOLS = [
+  'run_command',
+  'read_file',
+  'list_dir',
+  'write_file',
+  'docker_ps',
+  'docker_logs',
+  'service_status',
+  'process_list',
+  'remember'
+]
+
+/** 第二个冒烟脚本：验证「关掉应用重开，长期记忆还在」 */
+const SMOKE_MEMORY = path.join(ROOT, 'scripts', 'smoke-agent-memory.js')
 /** 并行轮里模型一次给出的两条命令（顺序即预期执行顺序） */
 const DOCKER_CMDS = ['docker ps -a', 'docker system df -v']
 
@@ -169,14 +190,14 @@ function startFakeLlm() {
           choices: [{ index: 0, delta: {} }],
           usage: { prompt_tokens: 42, completion_tokens: 33, total_tokens: 75 }
         })
-      const toolCall = (id, args, idx = 0) =>
+      const toolCall = (id, args, idx = 0, name = 'run_command') =>
         send({
           choices: [
             {
               index: 0,
               delta: {
                 tool_calls: [
-                  { index: idx, id, type: 'function', function: { name: 'run_command', arguments: JSON.stringify(args) } }
+                  { index: idx, id, type: 'function', function: { name, arguments: JSON.stringify(args) } }
                 ]
               }
             }
@@ -190,12 +211,42 @@ function startFakeLlm() {
 
       // 已经拿到工具结果：给最终结论
       if (toolMsg) {
+        const lastToolName = lastToolCall ? lastToolCall.tool_calls[0].function.name : ''
         const docker = DOCKER_CMDS.some((c) => lastToolCmd.includes(c))
         const df = !docker && lastToolCmd.includes('df')
-        const final = docker ? DOCKER_FINAL : df ? DF_FINAL : FREE_FINAL
+        const final =
+          lastToolName === 'read_file'
+            ? STRUCT_FINAL
+            : lastToolName === 'remember'
+              ? MEM_FINAL
+              : docker
+                ? DOCKER_FINAL
+                : df
+                  ? DF_FINAL
+                  : FREE_FINAL
         text(final.slice(0, 10))
         text(final.slice(10))
         stop('stop')
+        usage()
+        done()
+        return
+      }
+
+      // 结构化专用工具：模型不手写命令，只给「值」，由本地代码拼安全命令
+      if (goal.includes('结构化')) {
+        text('我用专用工具读一下 nginx 主配置。')
+        toolCall('call_struct', { path: '/etc/nginx/nginx.conf', lines: 20 }, 0, 'read_file')
+        stop('tool_calls')
+        usage()
+        done()
+        return
+      }
+
+      // 长期记忆：remember 是纯本地写盘，不经过终端
+      if (goal.includes('记住')) {
+        text('这条信息值得长期记住。')
+        toolCall('call_mem', { fact: MEM_FACT }, 0, 'remember')
+        stop('tool_calls')
         usage()
         done()
         return
@@ -303,45 +354,57 @@ async function main() {
   console.log(`\n=== Mock SSH:${MOCK_PORT} 就绪 · 假 LLM:${LLM_PORT} 就绪 ===`)
   console.log('=== 启动打包产物 dist/win-unpacked/EasySSH.exe ===\n')
 
-  const app = spawn(EXE, [`--user-data-dir=${userData}`], {
-    cwd: ROOT,
-    env: {
-      ...appEnv,
-      EASYSSH_SMOKE: path.join(ROOT, '.tmp-smoke-agent.png'),
-      EASYSSH_SMOKE_JS: SMOKE
-    },
-    stdio: ['ignore', 'pipe', 'pipe']
-  })
-
-  let stdout = ''
-  app.stdout.on('data', (d) => (stdout += d.toString()))
-  app.stderr.on('data', (d) => process.stderr.write(`[app] ${d}`))
-
-  const code = await new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      try {
-        app.kill('SIGKILL')
-      } catch {
-        /* ignore */
-      }
-      resolve(-1)
-    }, 150000)
-    app.on('exit', (c) => {
-      clearTimeout(timer)
-      resolve(c)
+  /**
+   * 起一次打包产物，跑一段冒烟脚本，拿回脚本返回值。
+   * 长期记忆的「跨会话」验证需要**第二次启动**（同一个 user-data-dir），
+   * 所以这里不能只写死在一次 spawn 上。
+   */
+  const launch = async (smokeScript, pngName, timeoutMs = 150000) => {
+    const app = spawn(EXE, [`--user-data-dir=${userData}`], {
+      cwd: ROOT,
+      env: {
+        ...appEnv,
+        EASYSSH_SMOKE: path.join(ROOT, pngName),
+        EASYSSH_SMOKE_JS: smokeScript
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
     })
-  })
-  ok('打包产物正常退出', code === 0, `exit=${code}`)
 
-  const m = stdout.match(/\[smoke\] script result: ([\s\S]*?)\n\[smoke\] screenshot/)
-  let result = null
-  try {
-    result = m ? JSON.parse(m[1]) : null
-  } catch {
-    result = null
+    let stdout = ''
+    app.stdout.on('data', (d) => (stdout += d.toString()))
+    app.stderr.on('data', (d) => process.stderr.write(`[app] ${d}`))
+
+    const code = await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        try {
+          app.kill('SIGKILL')
+        } catch {
+          /* ignore */
+        }
+        resolve(-1)
+      }, timeoutMs)
+      app.on('exit', (c) => {
+        clearTimeout(timer)
+        resolve(c)
+      })
+    })
+
+    const m = stdout.match(/\[smoke\] script result: ([\s\S]*?)\n\[smoke\] screenshot/)
+    let result = null
+    try {
+      result = m ? JSON.parse(m[1]) : null
+    } catch {
+      result = null
+    }
+    return { code, result, stdout }
   }
+
+  const run1 = await launch(SMOKE, '.tmp-smoke-agent.png')
+  const { code } = run1
+  const result = run1.result
+  ok('打包产物正常退出', code === 0, `exit=${code}`)
   if (!result) {
-    console.error('拿不到冒烟脚本结果，原始输出：\n' + stdout)
+    console.error('拿不到冒烟脚本结果，原始输出：\n' + run1.stdout)
     cleanup()
     process.exit(1)
   }
@@ -479,13 +542,52 @@ async function main() {
   ok('两条命令的整轮耗时远低于旧的超时等待', result.parElapsedMs < 20000, `${result.parElapsedMs} ms`)
   ok('两条命令之后模型给出了结论', result.parConclusion === DOCKER_FINAL, JSON.stringify(result.parConclusion))
 
+  /* ------------------------------- 结构化专用工具（read_file） */
+
+  ok('结构化工具轮收敛到 done', result.structState === 'done', String(result.structState))
+  ok('这一步被标记为 read_file 工具', result.structTool === 'read_file', String(result.structTool))
+  ok(
+    '命令由本地代码按参数拼出（含 -- 与转义引号）',
+    result.structCommand === STRUCT_CMD,
+    String(result.structCommand)
+  )
+  ok('结构化工具的步骤同样跑通了终端（退出码 0）', result.structStatus === 'done' && result.structExitCode === 0, `${result.structStatus}/${result.structExitCode}`)
+  ok('只读的结构化工具不带「写操作」危险标记', result.structDanger === false, String(result.structDanger))
+  ok('结构化工具的输出被回灌进时间线', /worker_processes/.test(String(result.structOutput)), String(result.structOutput).slice(0, 60))
+  ok('结构化工具的命令确实出现在可见终端流里', result.structTerminalSawIt === true, String(result.structTerminalSawIt))
+  ok(
+    '步骤块上渲染出工具名徽标（用户能看出这不是手写命令）',
+    Array.isArray(result.renderedToolBadges5) && result.renderedToolBadges5.includes('read_file'),
+    JSON.stringify(result.renderedToolBadges5)
+  )
+  ok('结构化工具轮也给出了结论', result.structConclusion === STRUCT_FINAL, JSON.stringify(result.structConclusion))
+
+  /* ------------------------------- 跨会话长期记忆（本会话内） */
+
+  ok('记忆轮收敛到 done', result.memState === 'done', String(result.memState))
+  ok('remember 不经过终端（这一轮没有任何步骤）', result.memStepCount === 0, `${result.memStepCount} 步`)
+  ok('模型记下的事实进了 store.agentMemory', result.memCount >= 1, `${result.memCount} 条`)
+  ok(
+    '记下的就是模型给的那条事实',
+    Array.isArray(result.memTexts) && result.memTexts.includes(MEM_FACT),
+    JSON.stringify(result.memTexts)
+  )
+  ok('remember 写下的来源标为 agent', result.memSource === 'agent', String(result.memSource))
+  ok('配置弹窗里渲染出记忆条目', result.memItemsRendered >= 1, `${result.memItemsRendered} 条`)
+  ok(
+    '记忆区块里能看到具体内容（用户可核对、可删除）',
+    /apt/.test(String(result.memSectionText)),
+    String(result.memSectionText).slice(0, 60)
+  )
+  ok('记忆轮也给出了结论', result.memConclusion === MEM_FINAL, JSON.stringify(result.memConclusion))
+
   /* ------------------------------- 假服务侧收到的请求 */
 
   const streamReqs = llm.seen.filter((r) => r.stream)
   const probeReqs = llm.seen.filter((r) => !r.stream)
   ok(
-    '假 LLM 收到 8 次流式请求（四轮 × 每轮两条：先要命令、再给结论）',
-    streamReqs.length === 8,
+    '假 LLM 收到 12 次流式请求（六轮 × 每轮两条：先要动作、再给结论）',
+    streamReqs.length === 12,
     `${streamReqs.length} 次`
   )
   ok('假 LLM 收到 1 次探测请求（非流式）', probeReqs.length === 1, `${probeReqs.length} 次`)
@@ -499,8 +601,8 @@ async function main() {
     ok('temperature 用的是保存的值', first.temperature === 0.2, String(first.temperature))
     ok('最后一条是用户提问', first.lastUser === '单步 Agent 验证：排查根分区磁盘使用情况', JSON.stringify(first.lastUser))
     ok(
-      '用原生 tool calling：tools 里声明了 run_command',
-      first.toolNames.includes('run_command'),
+      '用原生 tool calling：声明了全部 9 个工具（1 通用 + 7 结构化 + 1 记忆）',
+      ALL_TOOLS.every((t) => first.toolNames.includes(t)),
       JSON.stringify(first.toolNames)
     )
     ok('工具选择交给模型（tool_choice=auto）', first.toolChoice === 'auto', String(first.toolChoice))
@@ -528,6 +630,45 @@ async function main() {
     /docker ps -a/.test(mockLog) && /docker system df -v/.test(mockLog),
     'ok'
   )
+  ok(
+    '结构化工具拼出来的命令也真的落到了 PTY',
+    /head -n 20/.test(mockLog) && /\/etc\/nginx\/nginx\.conf/.test(mockLog),
+    'ok'
+  )
+
+  /* ------------------------------- 跨会话：关掉应用重开，记忆还在 */
+
+  const memFile = path.join(userData, 'data', 'agent-memory.json')
+  let memOnDisk = null
+  try {
+    memOnDisk = JSON.parse(readFileSync(memFile, 'utf8'))
+  } catch {
+    memOnDisk = null
+  }
+  ok('记忆已落盘到 agent-memory.json', !!memOnDisk, memFile)
+  const diskFacts = (memOnDisk && memOnDisk.profiles && memOnDisk.profiles[result.profileId]) || []
+  ok(
+    '落盘内容里就是模型记下的那条事实',
+    diskFacts.some((f) => f.text === MEM_FACT),
+    JSON.stringify(diskFacts.map((f) => f.text))
+  )
+
+  // 第二次启动：同一份 user-data-dir、复用同一条连接（profileId 不变）
+  const second2 = await launch(SMOKE_MEMORY, '.tmp-smoke-agent-memory.png', 90000)
+  ok('第二次启动正常退出', second2.code === 0, `exit=${second2.code}`)
+  const r2 = second2.result
+  if (!r2) {
+    console.error('拿不到第二次启动的结果，原始输出：\n' + second2.stdout)
+  } else {
+    if (r2.__scriptError) console.error('第二个脚本内部报错：' + r2.__scriptError)
+    ok('第二次启动复用了同一条连接（profileId 一致）', r2.reusedProfile === true && r2.profileId === result.profileId, `${r2.profileId} / ${result.profileId}`)
+    ok('第二次启动仍能连上 Mock SSH', r2.status === 'connected', String(r2.status))
+    ok('主进程能读回上一次的记忆', r2.fromMainOk === true && Array.isArray(r2.fromMain) && r2.fromMain.includes(MEM_FACT), JSON.stringify(r2.fromMain))
+    ok('记忆被灌进 store.agentMemory', Array.isArray(r2.inStore) && r2.inStore.includes(MEM_FACT), JSON.stringify(r2.inStore))
+    ok('重开后配置弹窗里能看到记忆条目', r2.renderedItems >= 1, `${r2.renderedItems} 条`)
+    ok('记忆条目带删除按钮（用户随时能纠正）', r2.renderedDeleteButtons >= 1, `${r2.renderedDeleteButtons} 个`)
+    ok('记忆区块标题写着「长期记忆」', r2.sectionLabelFound === true, String(r2.renderedText).slice(0, 50))
+  }
 
   console.log(`\n=== ${passed} passed, ${failed} failed ===`)
   if (failed) console.log(`失败项：\n  - ${failures.join('\n  - ')}`)

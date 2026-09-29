@@ -1,6 +1,6 @@
 {
   "name": "esay-ssh",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Easy SSH - Windows 桌面 SSH / SFTP / Docker 可视化管理工具",
   "main": "./out/main/index.js",
   "author": "szhadmin <571545079@qq.com>",

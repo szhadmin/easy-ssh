@@ -121,10 +121,24 @@ Windows 桌面端的 SSH / SFTP / Docker 可视化管理工具。面向"不想�
 - **模型可自动获取**：模型配置里点「获取模型」会调用 OpenAI 兼容的 `GET /v1/models` 并提供下拉候选；部分中转服务未实现这个接口时仍可手动填写模型名
 - **系统提示词不对用户展示**：界面只保留「补充要求」供你填写环境约束；内置角色规则和实际拼接的系统提示词不会显示
 - **Markdown 渲染**：支持标题、列表、引用、代码块、行内代码、加粗、删除线、链接；不解析原始 HTML，避免模型输出注入界面
-- **终端 Agent 用原生 tool calling**（基于 [Vercel AI SDK](https://ai-sdk.dev) 的 `streamText` + `stopWhen`）：终端工具栏点「AI 助手」在右侧打开抽屉，左侧终端始终可见。执行模式分为「手动执行 / 受限授权 / 完全信任（高级）」。模型通过 `run_command({ intent, command })` 工具**一次只申请一条单行命令**，由当前真实 PTY 执行后把输出与退出码回传，模型才决定下一步或收尾 —— 不再解析一整段回复后批量执行代码块
+- **终端 Agent 用原生 tool calling**（基于 [Vercel AI SDK](https://ai-sdk.dev) 的 `streamText` + `stopWhen`）：终端工具栏点「AI 助手」在右侧打开抽屉，左侧终端始终可见。执行模式分为「手动执行 / 受限授权 / 完全信任（高级）」。模型通过工具**一次只申请一条单行命令**，由当前真实 PTY 执行后把输出与退出码回传，模型才决定下一步或收尾 —— 不再解析一整段回复后批量执行代码块
+- **结构化工具集（9 个工具）**：除了通用的 `run_command({ intent, command })`，还有 7 个专用工具，命令由本地代码按参数拼接、路径与容器名一律过一遍单引号转义，模型没机会把 `; rm -rf /` 混进参数里（提示词约束不可靠，语法约束才可靠）：
+  | 工具 | 用途 | 生成的命令 |
+  | --- | --- | --- |
+  | `read_file` | 读文件片段（看配置/脚本/日志） | `head -n N -- '<path>'` |
+  | `list_dir` | 列目录 | `ls -alh -- '<path>'` |
+  | `write_file` | 写/覆盖文件（**需二次确认**） | `printf '%s' '<base64>' \| base64 -d > '<path>'` |
+  | `docker_ps` | 容器列表（默认含已停止） | `docker ps -a` |
+  | `docker_logs` | 容器日志 | `docker logs --tail N '<container>'` |
+  | `service_status` | systemd 服务状态 | `systemctl status --no-pager -l '<name>'` |
+  | `process_list` | 按 CPU / 内存排序取前 N | `ps aux --sort=-%mem \| head -n N` |
+
+  另有一个不碰终端的 `remember`（长期记忆，见下）。写操作（`write_file`）由主进程显式标记为「危险」，直接进二次确认闸门 —— 不依赖「危险命令正则」能不能认出 `base64 -d > 文件` 这种写法，不受模型措辞影响。
+- **跨会话长期记忆**：模型可以用 `remember` 把这台服务器的**长期事实**记下来（用的包管理器、关键配置路径、不能碰的目录、约定俗成的操作习惯），下次再连上这台机器时自动拼进系统提示词 —— 关掉应用重开、换一轮新对话都还在。存储落在 `userData/data/agent-memory.json`，**按服务器分组**，单台最多 50 条、单条 200 字，重复内容自动去重；记忆是模型自己写的、可能过时，所以提示词里明确留了纠错出口（发现与实际冲突以实际为准并更新旧说法），界面上也能逐条删除或整体清空 —— 记忆必须让用户看得见、删得掉
+- **多轮对话记忆**：同一台服务器上的连续对话会带上之前几轮的「目标 + 结论」作为上下文（不塞每一步的命令与输出，避免迅速顶满上下文），所以「接着说」「那个端口是不是有问题」这类追问能对上话；面板上的时间线仍然一轮一张卡，可单独重发或整体清空
 - **命令始终跑在你看得见的那个终端里**：命令由渲染层注入当前可见 PTY（不走后台 `ssh.exec`），回显、实时输出、`Ctrl+C` 都与手工输入一致。输出边界靠**纯 ASCII 行哨兵**标定（`__EASYSSH_AGENT_<token>_START__` / `_END__<code>`）—— 不能用 OSC，因为哨兵是拼进「键入的命令行」的，而 `ESC` 是 readline 的 meta 前缀会被连同后一字符一起吞掉，那样命令早就跑完了 Agent 却只能干等到超时
 - **一步多条命令会串行排队**：模型偶尔会在同一回合里一次给出两条命令。终端只有一个，多给的命令按顺序依次注入、一条跑完再跑下一条 —— 并发注入会让后一条把前一条的**输出边界**覆盖掉，表现就是「命令早跑完了，Agent 却一直显示等待终端结果」。回灌前还会剥掉终端输出的 ANSI 色码，免得 `[1m` 这类残渣既费 token 又干扰阅读
-- **多轮时间线**：每一轮任务是一个独立回合，新的对话**只追加、不覆盖**上一轮的展示；每轮里能看到「目标 → 每步的判断 / 命令 / 终端输出 / 退出码 → 结论」，可单独「重新发送」或整体「清空对话」
+- **多轮时间线**：每一轮任务是一个独立回合，新的对话**只追加、不覆盖**上一轮的展示；每轮里能看到「目标 → 每步的判断 / 命令 / 终端输出 / 退出码 → 结论」，可单独「重新发送」或整体「清空对话」。用专用工具生成的步骤会带上工具名徽标（如 `read_file`），写操作还会额外标一个「写操作」并在确认条里给出强警示
 - 上游错误翻译成人话：401 → Key 无效或过期、404 → 地址少了 `/v1`、429 → 限流/配额用尽、5xx → 上游异常，并附上服务商返回的原因
 
 ---
@@ -149,22 +163,27 @@ esay-ssh/
 │   ├── check-osc.mjs                # OSC 7 解析器 + Agent 哨兵扫描器自检（36 条用例，覆盖分片切法 + ANSI 剥离）
 │   ├── check-complete.cjs           # 补全引擎自检（88 条用例，纯逻辑、不起 Electron）
 │   ├── check-channels.cjs           # SSH 通道泄漏回归（37 条断言，含"旧写法必然被拒"的灵敏度自检）
-│   ├── check-agent.cjs              # AI 助手回归（65 条断言，配一个假 OpenAI 兼容服务 + 自建反向桥）
+│   ├── check-agent.cjs              # AI 助手回归（117 条断言，含参数转义 / 多轮历史 / 跨会话记忆 / 结构化工具）
+│   ├── check-cwd-ui.cjs             # 打包产物级「目录跟随」回归（18 条断言，含 Agent 抢跑注入竞态）
+│   ├── check-conn-stability.cjs     # 连接生命周期 / 意外掉线自愈回归（19 条断言）
 │   ├── tsconfig.check.json          # 补全自检的 TS→CJS 编译配置
 │   ├── tsconfig.ssh.json            # ssh-manager 自检的 TS→CJS 编译配置
-│   ├── tsconfig.agent.json          # agent.ts / agent-bridge.ts 自检的 TS→CJS 编译配置
+│   ├── tsconfig.agent.json          # agent.ts / agent-bridge.ts / agent-memory.ts 自检的 TS→CJS 编译配置
 │   ├── mock-ssh-server.mjs          # 本地 Mock SSH（pty 回显 + 内存 SFTP + MaxSessions 模拟 + 统计/杀连接端口）
 │   ├── smoke-cwd-sync.js            # 端到端冒烟（注入 → 目录同步 → 分栏断言）
+│   ├── smoke-cwd-race.js            # 端到端冒烟（shell 一起来就注入命令，验证钩子注入不被打乱）
 │   ├── smoke-completion.js          # 端到端冒烟（真实远端数据 → 补全链路 + 面板断言）
 │   ├── smoke-channels.js            # 端到端冒烟（40 次文件操作 + 终端存活 + 通道计数）
-│   ├── smoke-agent.js               # 端到端冒烟（AI 面板 → 工具调用 → 可见 PTY 执行 → 多轮时间线）
+│   ├── smoke-conn-stability.js      # 端到端冒烟（意外掉线 → 自动重连 → 状态恢复）
+│   ├── smoke-agent.js               # 端到端冒烟（AI 面板 → 工具调用 → 可见 PTY 执行 → 多轮时间线 → 结构化工具 → 记忆）
+│   ├── smoke-agent-memory.js        # 第二次启动的冒烟（复用同一条连接，验证跨会话记忆读回）
 │   ├── check-channels-ui.cjs        # 用打包产物跑通道冒烟并核对 Mock 统计（12 条断言）
-│   └── check-agent-ui.cjs           # 用打包产物 + 假 LLM 跑终端 Agent 全链路（81 条断言，含一步多命令）
+│   └── check-agent-ui.cjs           # 用打包产物 + 假 LLM 跑终端 Agent 全链路（109 条断言，含一步多命令 / 结构化工具 / 跨会话记忆）
 ├── src/
 │   ├── shared/                      # 主/渲染进程共用
 │   │   ├── types.ts                 # 数据模型
 │   │   ├── agent-roles.ts           # AI 角色模板（6 个专家人设）+ 供应商预设
-│   │   ├── agent-tools.ts           # 终端 Agent 的公共约定：工具名、命令校验、ASCII 哨兵、输出截断
+│   │   ├── agent-tools.ts           # 终端 Agent 的公共约定：工具名、命令校验、shq 单引号转义、ASCII 哨兵、输出截断
 │   │   ├── channels.ts              # IPC 通道名 + 事件名
 │   │   └── api.ts                   # window.api 类型契约
 │   ├── main/                        # 主进程（Node 侧，持有 SSH 连接）
@@ -175,7 +194,8 @@ esay-ssh/
 │   │   ├── monitor.ts               # /proc 指标采集与解析
 │   │   ├── docker.ts                # docker CLI 封装
 │   │   ├── complete.ts              # 补全的动态数据源（容器名 / 服务名 / 用户 / 分支 … 带缓存）
-│   │   ├── agent.ts                 # 终端 Agent：配置存储 + Vercel AI SDK 工具调用循环（streamText + stopWhen）
+│   │   ├── agent.ts                 # 终端 Agent：配置存储 + Vercel AI SDK 工具调用循环（streamText + stopWhen + 9 个工具）
+│   │   ├── agent-memory.ts          # 跨会话长期记忆：按服务器分组落盘、去重、50 条上限、拼进 system
 │   │   ├── agent-bridge.ts          # 工具执行的反向通道：主进程 ↔ 渲染层可见 PTY（挂起等待 + 超时兜底）
 │   │   └── store.ts                 # 连接配置 + safeStorage 凭据加密
 │   ├── preload/
@@ -200,8 +220,8 @@ esay-ssh/
 │               ├── TerminalPanel.tsx
 │               ├── FilesPanel.tsx   # 全宽 / 紧凑两种形态，含权限弹窗与 CodeMirror 编辑器
 │               ├── DockerPanel.tsx  # 含容器抽屉与容器内终端
-│               ├── AgentPanel.tsx   # 终端 Agent 时间线（多轮累积）、Markdown、授权确认
-│               └── AgentSettings.tsx # LLM 配置、角色提示词、连接测试
+│               ├── AgentPanel.tsx   # 终端 Agent 时间线（多轮累积）、Markdown、授权确认、工具名/写操作徽标
+│               └── AgentSettings.tsx # LLM 配置、角色提示词、连接测试、长期记忆增删清空
 └── out/                             # 构建产物（main / preload / renderer）
 ```
 
@@ -317,12 +337,21 @@ node scripts/check-complete.cjs          # === 88 passed, 0 failed ===
 node scripts/check-channels-ui.cjs       # === 12 passed, 0 failed ===
 
 # 终端 Agent 主进程逻辑：Key 加密、配置、探测、原生 tool calling、反向桥、
-# 非法命令拦下、用户拒绝、步数上限、中止与错误翻译
+# 非法命令拦下、用户拒绝、步数上限、中止与错误翻译、
+# 单引号转义（10 种注入载荷交给真实 sh 跑一遍）、多轮 history、跨会话长期记忆、
+# 7 个结构化工具的命令生成与危险标记
 npx tsc -p scripts/tsconfig.agent.json
-node scripts/check-agent.cjs              # === 65 passed, 0 failed ===
+node scripts/check-agent.cjs              # === 117 passed, 0 failed ===
 
-# 终端 Agent 全链路：真实打包产物 + Mock SSH + 假 OpenAI 兼容服务
-node scripts/check-agent-ui.cjs            # === 81 passed, 0 failed ===
+# 终端 Agent 全链路：真实打包产物 + Mock SSH + 假 OpenAI 兼容服务。
+# 会启动两次应用（同一次 user-data-dir），第二次专门验「关掉重开记忆还在」
+node scripts/check-agent-ui.cjs            # === 109 passed, 0 failed ===
+
+# 终端目录跟随（打包产物级）：等钩子注入后 cd、以及 shell 一起来就抢先注入
+node scripts/check-cwd-ui.cjs              # === 18 passed, 0 failed ===
+
+# SSH 连接生命周期 / 意外掉线自愈
+node scripts/check-conn-stability.cjs      # === 19 passed, 0 failed ===
 ```
 
 > ⚠️ `ai` / `@ai-sdk/openai-compatible` / `zod` 都是 **ESM-only** 包，而 Electron 33 内置的

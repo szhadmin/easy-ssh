@@ -39,7 +39,8 @@ const api: EasySshApi = {
 
   term: {
     open: (args: unknown) => ipcRenderer.invoke(CH.TERM_OPEN, args),
-    write: (termId: string, data: string) => ipcRenderer.invoke(CH.TERM_WRITE, termId, data),
+    write: (termId: string, data: string, internal?: boolean) =>
+      ipcRenderer.invoke(CH.TERM_WRITE, termId, data, internal === true),
     resize: (termId: string, cols: number, rows: number) =>
       ipcRenderer.invoke(CH.TERM_RESIZE, termId, cols, rows),
     close: (termId: string) => ipcRenderer.invoke(CH.TERM_CLOSE, termId),
@@ -100,6 +101,13 @@ const api: EasySshApi = {
     run: (req: unknown) => ipcRenderer.invoke(CH.AGENT_RUN, req),
     toolResult: (reply: unknown) => ipcRenderer.invoke(CH.AGENT_TOOL_RESULT, reply),
     abort: (runId: string) => ipcRenderer.invoke(CH.AGENT_ABORT, runId),
+    /** 跨会话长期记忆（按服务器） */
+    listMemory: (profileId: string) => ipcRenderer.invoke(CH.AGENT_MEMORY_LIST, profileId),
+    addMemory: (profileId: string, text: string) =>
+      ipcRenderer.invoke(CH.AGENT_MEMORY_ADD, profileId, text),
+    removeMemory: (profileId: string, id: string) =>
+      ipcRenderer.invoke(CH.AGENT_MEMORY_REMOVE, profileId, id),
+    clearMemory: (profileId: string) => ipcRenderer.invoke(CH.AGENT_MEMORY_CLEAR, profileId),
     onEvent: (cb: (e: AgentRunEvent) => void): Unsub => on(EV.AGENT_RUN_EVENT, cb),
     /** 主进程请求在渲染层当前可见的终端里执行一条命令 */
     onToolExec: (cb: (req: AgentToolExecRequest) => void): Unsub => on(EV.AGENT_TOOL_EXEC, cb)

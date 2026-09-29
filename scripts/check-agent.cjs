@@ -35,6 +35,7 @@ const Module = require('node:module')
 const ROOT = path.resolve(__dirname, '..')
 const TMP = path.join(ROOT, '.tmp-agent-cjs')
 const COMPILED = path.join(TMP, 'src', 'main', 'agent.js')
+const COMPILED_MEMORY = path.join(TMP, 'src', 'main', 'agent-memory.js')
 const BRIDGE = path.join(TMP, 'src', 'main', 'agent-bridge.js')
 
 const GOOD_KEY = 'sk-test-abcdefghijklmnop'
@@ -147,8 +148,17 @@ const SCENES = {
   BAD_CMD: '场景:非法命令',
   BOOM: '场景:上游报错',
   SLOW: '场景:慢流',
-  LOOP: '场景:无限工具'
+  LOOP: '场景:无限工具',
+  PARALLEL: '场景:并发工具',
+  STRUCT: '场景:结构化',
+  MEM: '场景:记忆'
 }
+
+/** 记忆场景固定要记的那条事实（断言用） */
+const MEM_FACT = '这台机器用 apt 管理软件包，不是 yum'
+
+/** 假上游收到的每个请求体，用来断言「到底发了什么 messages / system」 */
+const REQ_BODIES = []
 
 function startFakeLlm() {
   const server = http.createServer((req, res) => {
@@ -196,6 +206,8 @@ function startFakeLlm() {
       }
 
       const model = body.model
+      // 记下请求体：用来断言「多轮历史真的被塞进了 messages」「长期记忆真的进了 system」
+      REQ_BODIES.push(body)
 
       // 非流式：给 probe 用
       if (!body.stream) {
@@ -270,6 +282,47 @@ function startFakeLlm() {
         text('我把两条命令一起发给你。')
         toolCall('call_par1', 'run_command', { intent: '看容器列表', command: 'docker ps -a' }, 0)
         toolCall('call_par2', 'run_command', { intent: '看空间占用', command: 'docker system df -v' }, 1)
+        stop('tool_calls')
+        usage()
+        done()
+        return
+      }
+
+      // 结构化专用工具：目标里写 `场景:结构化::工具名::JSON参数`
+      if (goal.includes(SCENES.STRUCT)) {
+        if (hasToolMsg) {
+          text('结构化工具的结果已经拿到了。')
+          stop('stop')
+          usage()
+          done()
+          return
+        }
+        const spec = goal.split('::')
+        const name = (spec[1] || 'read_file').trim()
+        let args = {}
+        try {
+          args = JSON.parse(spec[2] || '{}')
+        } catch {
+          args = {}
+        }
+        toolCall('call_struct', name, args)
+        stop('tool_calls')
+        usage()
+        done()
+        return
+      }
+
+      // 长期记忆：第一轮调 remember，第二轮给结论
+      if (goal.includes(SCENES.MEM)) {
+        if (hasToolMsg) {
+          text('已经记住了，以后会按这个来。')
+          stop('stop')
+          usage()
+          done()
+          return
+        }
+        text('这条信息值得长期记住。')
+        toolCall('call_mem', 'remember', { fact: MEM_FACT })
         stop('tool_calls')
         usage()
         done()
@@ -645,6 +698,293 @@ async function main() {
   await waitFor(events, (e) => e.runId === 'r10' && e.type === 'finish')
   const text10 = events.filter((e) => e.type === 'text').map((e) => e.text).join('')
   ok('Base URL 粘成完整 /chat/completions 也能正常用', text10 === '你好，这是一段流式输出。', JSON.stringify(text10))
+
+  /* ---------- ④ 共享层：参数转义（结构化工具防注入的根基） ---------- */
+
+  const sharedTools = require(ALIAS['@shared/agent-tools'])
+  const { shq } = sharedTools
+
+  ok('shq 把普通参数包成单引号字面量', shq('/etc/nginx/nginx.conf') === "'/etc/nginx/nginx.conf'", shq('/etc/nginx/nginx.conf'))
+  ok("shq 把参数里的单引号转义成 '\\''", shq("it's") === "'it'\\''s'", shq("it's"))
+  ok('shq 对空串也给出合法字面量', shq('') === "''", shq(''))
+
+  // 真刀真枪：把注入载荷交给系统 shell 跑一遍，输出必须原样等于载荷本身。
+  // 这条断言才是「防注入」的真正证据 —— 光看字符串长得对不算数。
+  const { spawnSync } = require('node:child_process')
+  const pickShell = () => {
+    for (const bin of ['sh', 'bash']) {
+      const probe = spawnSync(bin, ['-c', 'printf %s ok'], { encoding: 'utf8' })
+      if (!probe.error && probe.status === 0 && probe.stdout === 'ok') return bin
+    }
+    return null
+  }
+  const SHELL = pickShell()
+  if (!SHELL) {
+    console.log('SKIP  未找到可用的 sh/bash，跳过「真实 shell 转义」断言')
+  } else {
+    const INJECTS = [
+      'plain',
+      "a'b",
+      'a; echo INJECTED',
+      'a && echo INJECTED',
+      "a'b; echo INJECTED",
+      '$(echo INJECTED)',
+      '`echo INJECTED`',
+      'a > injected.txt',
+      'a | tee injected.txt',
+      'a\n echo INJECTED'
+    ]
+    let allSafe = true
+    const offenders = []
+    for (const p of INJECTS) {
+      // 结构化工具就是这么拼命令的：把参数交给 shq 后直接进 shell
+      const r = spawnSync(SHELL, ['-c', `printf %s ${shq(p)}`], { encoding: 'utf8' })
+      if (r.stdout !== p || r.status !== 0) {
+        allSafe = false
+        offenders.push(JSON.stringify(p) + '=>' + JSON.stringify(r.stdout))
+      }
+    }
+    ok(`注入载荷经 shq 后原样传递、不会被执行（${INJECTS.length} 种）`, allSafe, offenders.join(' ; ') || `${SHELL} 全部原样输出`)
+  }
+
+  // 组装成真实命令后，仍必须过得了「单步协议」这道闸门
+  ok(
+    '转义后的读文件命令是合法的单步命令',
+    sharedTools.sanitizeAgentCommand(`head -n 50 -- ${shq('/etc/nginx/nginx.conf')}`) ===
+      "head -n 50 -- '/etc/nginx/nginx.conf'",
+    'ok'
+  )
+  ok(
+    '路径里塞入 ; rm -rf 时宁可直接拒绝（fail-closed）也不放行',
+    sharedTools.sanitizeAgentCommand(`head -n 50 -- ${shq("/etc/x'; rm -rf / #")}`) === null,
+    String(sharedTools.sanitizeAgentCommand(`head -n 50 -- ${shq("/etc/x'; rm -rf / #")}`))
+  )
+
+  /* ---------- ⑤ 多轮记忆：历史轮次真的进了 messages ---------- */
+
+  REQ_BODIES.length = 0
+  events = []
+  await agent.run({
+    runId: 'r12',
+    profileId: 'p1',
+    goal: `${SCENES.TEXT}：接着上一轮说`,
+    history: [
+      { goal: '上一轮：先看看磁盘', conclusion: '上一轮结论：/ 用了 87%' },
+      { goal: '这一轮没有结论，应该被跳过' }
+    ]
+  })
+  await waitFor(events, (e) => e.runId === 'r12' && e.type === 'finish')
+  const body12 = REQ_BODIES[REQ_BODIES.length - 1] || {}
+  const msgs12 = (body12.messages || []).filter((m) => m.role !== 'system')
+  ok(
+    '历史轮次按 user/assistant 成对补进 messages',
+    msgs12.length === 3 &&
+      msgs12[0].role === 'user' &&
+      msgs12[0].content === '上一轮：先看看磁盘' &&
+      msgs12[1].role === 'assistant' &&
+      msgs12[1].content === '上一轮结论：/ 用了 87%' &&
+      msgs12[2].role === 'user',
+    JSON.stringify(msgs12.map((m) => `${m.role}:${String(m.content).slice(0, 10)}`))
+  )
+  ok(
+    '没有结论的轮次被跳过（避免出现没人回应的 user 消息）',
+    !JSON.stringify(msgs12).includes('没有结论，应该被跳过'),
+    'ok'
+  )
+  ok(
+    '本次目标始终是最后一条 user 消息',
+    String(msgs12[msgs12.length - 1].content).includes('接着上一轮说'),
+    String(msgs12[msgs12.length - 1].content)
+  )
+
+  REQ_BODIES.length = 0
+  events = []
+  await agent.run({ runId: 'r12b', profileId: 'p1', goal: `${SCENES.TEXT}：全新的` })
+  await waitFor(events, (e) => e.runId === 'r12b' && e.type === 'finish')
+  const msgs12b = (REQ_BODIES[REQ_BODIES.length - 1].messages || []).filter((m) => m.role !== 'system')
+  ok('不带 history 时 messages 里只有本次目标（不会凭空多出历史）', msgs12b.length === 1, `len=${msgs12b.length}`)
+  ok('多轮场景跑完 activeCount 也归零', await waitZero(agent), `active=${agent.activeCount()}`)
+
+  /* ---------- ⑥ 跨会话长期记忆 ---------- */
+
+  // 记忆对外暴露在 agent-memory.ts 上（IPC 直接调它），所以这里也直接测这个模块
+  let memApi = require(COMPILED_MEMORY)
+  const memProfile = 'p-mem'
+  const memFile = path.join(userDataDir, 'data', 'agent-memory.json')
+  ok('一开始这台服务器没有任何记忆', (await memApi.listFacts(memProfile)).length === 0, 'ok')
+
+  events = []
+  execReqs.length = 0
+  autoReply = approve('ok', 0)
+  REQ_BODIES.length = 0
+  await agent.run({ runId: 'r13', profileId: memProfile, goal: `${SCENES.MEM}：记一下` })
+  const memEvt = await waitFor(events, (e) => e.runId === 'r13' && e.type === 'memory')
+  ok(
+    '模型调 remember 会推 memory 事件并带上完整列表',
+    Array.isArray(memEvt.facts) && memEvt.facts.some((f) => f.text === MEM_FACT),
+    JSON.stringify(memEvt.facts)
+  )
+  ok('remember 记下的事实标 source=agent', memEvt.facts.every((f) => f.source === 'agent'), 'ok')
+  ok('remember 不执行任何终端命令（纯本地写盘）', execReqs.length === 0, `exec=${execReqs.length}`)
+
+  let facts = await memApi.listFacts(memProfile)
+  ok('记忆已经落到列表里', facts.length === 1 && facts[0].text === MEM_FACT, JSON.stringify(facts))
+  ok(
+    '记忆落盘到 agent-memory.json',
+    fs.existsSync(memFile) && fs.readFileSync(memFile, 'utf8').includes('apt'),
+    memFile
+  )
+  ok('记忆按服务器隔离（别的服务器读不到）', (await memApi.listFacts('p-other')).length === 0, 'ok')
+
+  // 第二轮：记忆必须出现在 system 里 —— 这才是「下次还记得」的实现方式
+  REQ_BODIES.length = 0
+  events = []
+  await agent.run({ runId: 'r14', profileId: memProfile, goal: `${SCENES.TEXT}：还记得吗` })
+  await waitFor(events, (e) => e.runId === 'r14' && e.type === 'finish')
+  const sys14 = ((REQ_BODIES[REQ_BODIES.length - 1].messages || []).find((m) => m.role === 'system') || {}).content || ''
+  ok('长期记忆被注入 system 提示词', sys14.includes('apt') && sys14.includes(MEM_FACT), sys14.slice(0, 60))
+  ok('记忆区明确留了纠错出口（过时以实际为准）', sys14.includes('过时') && sys14.includes('以实际'), sys14.slice(-60))
+
+  // 跨会话：把 agent 与 agent-memory 两个模块都从缓存里清掉，等价于关掉应用重开
+  delete require.cache[require.resolve(COMPILED_MEMORY)]
+  agent = loadAgent()
+  memApi = require(COMPILED_MEMORY)
+  // 重新挂上事件收集（bridge 是同一个模块实例，反向通道不用重装）
+  agent.setEventSink((e) => events.push(e))
+  const memAfterRestart = await memApi.listFacts(memProfile)
+  ok(
+    '模拟重启（关应用重开）后记忆仍在',
+    memAfterRestart.length === 1 && memAfterRestart[0].text === MEM_FACT,
+    JSON.stringify(memAfterRestart.map((f) => f.text))
+  )
+
+  const dup = await memApi.addFact(memProfile, MEM_FACT, 'user')
+  ok('重复记同一条不会新增', dup.added === false && dup.facts.length === 1, JSON.stringify(dup.reason))
+  const manual = await memApi.addFact(memProfile, '这个项目统一用 8080 端口', 'user')
+  ok(
+    '手动补的记忆标 source=user（与模型自己记的区分开）',
+    manual.added === true && manual.facts.some((f) => f.source === 'user' && f.text === '这个项目统一用 8080 端口'),
+    'ok'
+  )
+  ok('空白内容不会被记下', (await memApi.addFact(memProfile, '   ', 'user')).added === false, 'ok')
+  ok(
+    '多余空白会被压成一个空格（去重才有效）',
+    (await memApi.addFact(memProfile, '这条   有   很多   空白', 'user')).facts.some((f) => f.text === '这条 有 很多 空白'),
+    'ok'
+  )
+  const longOne = await memApi.addFact(memProfile, 'x'.repeat(500), 'user')
+  ok(
+    '单条过长会被截断到 200 字以内',
+    longOne.facts.every((f) => f.text.length <= 200),
+    `max=${Math.max(...longOne.facts.map((f) => f.text.length))}`
+  )
+
+  for (let i = 0; i < 60; i++) await memApi.addFact(memProfile, `压测记忆条目 ${i}`, 'user')
+  const capped = await memApi.listFacts(memProfile)
+  ok('单台服务器最多保留 50 条记忆', capped.length === 50, `len=${capped.length}`)
+  ok(
+    '超出上限时挤掉最旧的、保留最新的',
+    capped.some((f) => f.text === '压测记忆条目 59') && !capped.some((f) => f.text === '压测记忆条目 1'),
+    `首条=${capped[0] && capped[0].text}`
+  )
+
+  const firstId = (await memApi.listFacts(memProfile))[0].id
+  const afterRemove = await memApi.removeFact(memProfile, firstId)
+  ok(
+    '删除单条记忆',
+    afterRemove.length === 49 && !afterRemove.some((f) => f.id === firstId),
+    `len=${afterRemove.length}`
+  )
+  const afterClear = await memApi.clearFacts(memProfile)
+  ok('清空这台服务器的记忆', afterClear.length === 0, `len=${afterClear.length}`)
+  const memRaw = JSON.parse(fs.readFileSync(memFile, 'utf8'))
+  ok(
+    '清空后落盘内容也是空的',
+    !memRaw.profiles[memProfile] || memRaw.profiles[memProfile].length === 0,
+    JSON.stringify(memRaw.profiles[memProfile])
+  )
+
+  /* ---------- ⑦ 结构化专用工具：命令生成 + 参数转义 + 危险标记 ---------- */
+
+  /** 跑一轮「模型调用指定结构化工具」的场景，返回这一轮的 tool-call 与反向请求 */
+  const runStruct = async (runId, toolName, args) => {
+    events = []
+    execReqs.length = 0
+    autoReply = approve('ok', 0)
+    await agent.run({
+      runId,
+      profileId: 'p-struct',
+      goal: `${SCENES.STRUCT}::${toolName}::${JSON.stringify(args)}`
+    })
+    await waitFor(events, (e) => e.runId === runId && e.type === 'finish')
+    return {
+      call: events.find((e) => e.runId === runId && e.type === 'tool-call'),
+      req: execReqs.find((r) => r.runId === runId)
+    }
+  }
+
+  const rf = await runStruct('r20', 'read_file', { path: '/etc/nginx/nginx.conf', lines: 50 })
+  ok(
+    'read_file 生成 head 命令（带 -- 与转义引号）',
+    !!rf.call && rf.call.tool === 'read_file' && rf.call.command === "head -n 50 -- '/etc/nginx/nginx.conf'",
+    rf.call && rf.call.command
+  )
+  ok('read_file 默认取 200 行', (await runStruct('r20b', 'read_file', { path: '/etc/hosts' })).call.command === "head -n 200 -- '/etc/hosts'", 'ok')
+
+  const ld = await runStruct('r21', 'list_dir', { path: '/var/log' })
+  ok('list_dir 生成 ls -alh -- path', ld.call.command === "ls -alh -- '/var/log'", ld.call.command)
+  ok('list_dir 省略路径时列当前目录', (await runStruct('r21b', 'list_dir', {})).call.command === 'ls -alh', 'ok')
+  ok('list_dir all=false 时不带 -a', (await runStruct('r21c', 'list_dir', { path: '/tmp', all: false })).call.command === "ls -lh -- '/tmp'", 'ok')
+
+  const dps = await runStruct('r22', 'docker_ps', {})
+  ok('docker_ps 默认含已停止容器', dps.call.command === 'docker ps -a', dps.call.command)
+  ok('docker_ps runningOnly=true 只看运行中', (await runStruct('r22b', 'docker_ps', { runningOnly: true })).call.command === 'docker ps', 'ok')
+
+  const dl = await runStruct('r23', 'docker_logs', { container: 'my-app', tail: 100 })
+  ok('docker_logs 生成 docker logs --tail N container', dl.call.command === "docker logs --tail 100 'my-app'", dl.call.command)
+
+  const ss = await runStruct('r24', 'service_status', { name: 'nginx' })
+  ok('service_status 生成 systemctl status 并关掉分页', ss.call.command === "systemctl status --no-pager -l 'nginx'", ss.call.command)
+
+  const pl = await runStruct('r25', 'process_list', { sort: 'cpu', limit: 5 })
+  ok('process_list 按 CPU 排序取前 5', pl.call.command === 'ps aux --sort=-%cpu | head -n 5', pl.call.command)
+  ok('process_list 默认按内存排序取前 20', (await runStruct('r25b', 'process_list', {})).call.command === 'ps aux --sort=-%mem | head -n 20', 'ok')
+
+  const wf = await runStruct('r26', 'write_file', { path: '/tmp/a.conf', content: 'server { listen 80; }\n' })
+  ok(
+    'write_file 用 base64 传输内容（避免引号/换行把命令打烂）',
+    !!wf.call && /^printf '%s' '[A-Za-z0-9+/=]+' \| base64 -d > '\/tmp\/a\.conf'$/.test(wf.call.command),
+    wf.call && wf.call.command
+  )
+  ok(
+    'write_file 的 base64 能解出原文',
+    Buffer.from(((wf.call.command.match(/printf '%s' '([A-Za-z0-9+/=]+)'/) || [])[1] || ''), 'base64').toString('utf8') ===
+      'server { listen 80; }\n',
+    'ok'
+  )
+  ok('write_file 的 tool-call 带写操作标记（界面强警示）', wf.call.danger === true, String(wf.call.danger))
+  ok('write_file 在反向请求里声明 dangerous（进二次确认闸门）', !!wf.req && wf.req.dangerous === true, String(wf.req && wf.req.dangerous))
+  ok('write_file 的反向请求同样带上工具名', !!wf.req && wf.req.tool === 'write_file', wf.req && wf.req.tool)
+
+  ok('只读工具不标危险', ld.call.danger !== true && dps.call.danger !== true && ss.call.danger !== true, 'ok')
+  ok('run_command 仍带工具名、且不标危险（重构后行为不变）', await (async () => {
+    const rc = await runStruct('r28', 'run_command', { intent: '看磁盘', command: 'df -h' })
+    return rc.call.tool === 'run_command' && rc.call.danger !== true && rc.req.command === 'df -h'
+  })(), 'ok')
+
+  // 参数注入：容器名里塞恶意串，转义后必须原样保留，且带 ; 的命令被单步协议拒之门外
+  const evil = await runStruct('r27', 'docker_logs', { container: "my-app'; rm -rf /tmp/x; echo '" })
+  ok(
+    "容器名里的单引号被转义成 '\\''（注入不会跑出第二条命令）",
+    !!evil.call && evil.call.command.includes("'\\''"),
+    evil.call && evil.call.command
+  )
+  ok(
+    '含 ; 的注入命令被单步协议拦下、根本没送进终端（fail-closed）',
+    !!evil.call && !evil.req,
+    `req=${evil.req ? '有' : '无'}`
+  )
+  ok('被拦下的结构化调用仍能让任务收敛', !!events.find((e) => e.runId === 'r27' && e.type === 'finish'), 'ok')
 
   /* ---------- 收尾 ---------- */
 

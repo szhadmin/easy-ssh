@@ -264,6 +264,10 @@ export interface AgentToolStep {
   /** 模型给出的这一步意图：这条命令想确认什么 */
   intent: string
   command: string
+  /** 触发这一步的工具名，便于界面区分「手写命令」与「专用工具」 */
+  tool?: string
+  /** 这一步是否为写操作（需要更强的确认提示） */
+  danger?: boolean
   status: 'pending' | 'confirming' | 'running' | 'done' | 'failed' | 'denied' | 'cancelled'
   /** 调用这条命令之前，模型本轮说给自己/用户的判断文字 */
   thinking?: string
@@ -292,11 +296,38 @@ export interface AgentRunView {
   createdAt: number
 }
 
+/**
+ * 跨会话的长期记忆条目（每台服务器一份）。
+ *
+ * 与会话内历史的区别：历史只活在当前这次对话里，重开应用就没了；
+ * 这里记的是「下次再连上这台机器时依然成立的东西」。
+ */
+export interface AgentMemoryFact {
+  id: string
+  text: string
+  createdAt: number
+  /** 模型自己记的 / 用户手动加的 */
+  source: 'agent' | 'user'
+}
+
+/**
+ * 带进模型的一段历史对话。
+ *
+ * 只保留「用户要了什么」与「上一轮得出了什么结论」—— 每一步的命令与终端输出
+ * 又多又碎，全塞进上下文会迅速顶满窗口，而模型真正需要记住的就是这两样。
+ */
+export interface AgentHistoryTurn {
+  goal: string
+  conclusion?: string
+}
+
 /** 启动一次 Agent 任务的入参 */
 export interface AgentRunRequest {
   runId: string
   profileId: string
   goal: string
+  /** 前几轮的对话摘要（渲染层已按字符预算裁剪好），让模型记得刚才聊过什么 */
+  history?: AgentHistoryTurn[]
   /** 选中的专家角色 id，主进程据此拼 system prompt */
   roleId?: string
   /** 角色补充提示词（用户在「模型配置」里自行改写的那部分） */
@@ -312,7 +343,17 @@ export type AgentRunEvent =
   | { runId: string; type: 'text'; text: string }
   | { runId: string; type: 'reasoning'; text: string }
   /** 模型请求执行一条命令（此刻命令尚未执行） */
-  | { runId: string; type: 'tool-call'; stepId: string; intent: string; command: string }
+  | {
+      runId: string
+      type: 'tool-call'
+      stepId: string
+      intent: string
+      command: string
+      /** 触发这一步的工具名（run_command / read_file / write_file …） */
+      tool?: string
+      /** 写操作标记：界面据此给出更强的警示文案 */
+      danger?: boolean
+    }
   /** 一步结束：拿到终端回显与退出码，或被拒绝 / 命令非法未执行 */
   | {
       runId: string
@@ -323,6 +364,8 @@ export type AgentRunEvent =
       exitCode: number
     }
   | { runId: string; type: 'finish'; text: string; reason?: string }
+  /** 长期记忆有变动（模型用 remember 记了新的事实），界面据此刷新列表 */
+  | { runId: string; type: 'memory'; facts: AgentMemoryFact[] }
   | { runId: string; type: 'error'; message: string }
   | { runId: string; type: 'aborted' }
 
@@ -333,6 +376,14 @@ export interface AgentToolExecRequest {
   profileId: string
   intent: string
   command: string
+  /** 触发这一步的工具名 */
+  tool?: string
+  /**
+   * 强制走二次确认。
+   * 结构化工具生成的命令（如 write_file 的 `base64 -d > path`）不一定能被
+   * 渲染层的「危险命令正则」识别出来，所以由主进程显式声明。
+   */
+  dangerous?: boolean
 }
 
 /** 渲染层 -> 主进程：这一步的执行结果 */

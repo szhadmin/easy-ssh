@@ -286,7 +286,7 @@ export function FilesPanel({
   const cdInTerminal = (): void => {
     // 单引号包裹，内部单引号按 shell 规则转义成 '\''
     const quoted = `'${cwd.replace(/'/g, `'\\''`)}'`
-    void window.api.term.write(profile.id, ` cd ${quoted}\r`)
+    void window.api.term.write(profile.id, ` cd ${quoted}\r`, true)
     toast('info', '已在终端执行 cd', cwd)
   }
 

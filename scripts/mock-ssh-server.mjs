@@ -100,6 +100,69 @@ const EXEC_FIXTURES = [
   [/for-each-ref/, () => 'main\nfeature/pay\nrelease/1.2\n'],
   [/git -C .* remote/, () => 'origin\nupstream\n'],
 
+  /* ---------------------------------------------- 结构化专用工具的固定输出
+   *
+   * Agent 的 read_file / list_dir / docker_ps / docker_logs / service_status /
+   * process_list / write_file 会拼出这些命令。Mock 必须能应答，
+   * 否则「结构化工具真的跑在可见终端里」这件事在打包产物级 e2e 里无从验证。
+   * 注意：这些正则用 ^ 锚定在命令开头，避免和 process_list 里的 `| head -n N` 撞车。
+   */
+  [
+    /^head -n \d+ -- /,
+    () =>
+      [
+        'user  nginx;',
+        'worker_processes  auto;',
+        'error_log  /var/log/nginx/error.log warn;',
+        'events {',
+        '    worker_connections  1024;',
+        '}',
+        'http {',
+        '    include       /etc/nginx/mime.types;',
+        '    client_max_body_size 64m;',
+        '}'
+      ].join('\n')
+  ],
+  [
+    /^ls -[a-z]*a[a-z]* -- /,
+    () =>
+      [
+        'total 48',
+        'drwxr-xr-x  2 root root 4096 Sep 29 10:00 conf.d',
+        '-rw-r--r--  1 root root 1077 Sep 20 09:12 nginx.conf',
+        '-rw-r--r--  1 root root  664 Sep 20 09:12 mime.types'
+      ].join('\n')
+  ],
+  [/^ls -[a-z]* -- /, () => 'total 8\ndrwxrwxrwt  2 root root 4096 Sep 29 10:00 tmp\n'],
+  [/^docker logs --tail \d+ /, () => '2026/09/29 10:00:01 [notice] nginx/1.27 started\n'],
+  [
+    /^systemctl status --no-pager -l /,
+    () =>
+      [
+        '● nginx.service - A high performance web server and a reverse proxy server',
+        '     Loaded: loaded (/lib/systemd/system/nginx.service; enabled)',
+        '     Active: active (running) since Mon 2026-09-29 09:00:00 CST; 1h 50min ago',
+        '   Main PID: 2140 (nginx)',
+        '      Tasks: 5 (limit: 8850)',
+        '     Memory: 12.4M'
+      ].join('\n')
+  ],
+  [/^journalctl -u /, () => 'Sep 29 10:00:01 mock nginx[2140]: worker started\n'],
+  [
+    /^ps aux --sort=-%[a-z]+ \| head -n \d+/,
+    () =>
+      [
+        'USER       PID %CPU %MEM    VSZ   RSS COMMAND',
+        'root      2140 12.7  8.2 812345 67890 java -jar app.jar',
+        'mysql     3201  2.1 14.5 987654 123456 mysqld',
+        'www-data   812  0.3  1.1  45678  9012 nginx: worker process'
+      ].join('\n')
+  ],
+  [
+    /^printf '%s' '[A-Za-z0-9+/=]+' \| base64 -d > /,
+    () => '（base64 已解码并写入目标文件）'
+  ],
+
   /* ---------------------------------------------- 系统信息 / 指标采集脚本
    *
    * 这两支脚本以前 Mock 没实现，于是「认证成功但探测全空」也能一路绿 —— 

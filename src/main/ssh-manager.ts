@@ -1,7 +1,7 @@
 import { Client, type ClientChannel, type SFTPWrapper, type Stats } from 'ssh2'
 import { readFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
-import { ShellIntegration } from './shell-integration'
+import { ShellIntegration, USER_IDLE_MS } from './shell-integration'
 import type {
   ConnectionProfile,
   ConnectionSecret,
@@ -87,8 +87,14 @@ export interface Session {
 interface TerminalRecord {
   stream: ClientChannel
   profileId: string
-  /** 用户是否已经自己敲过键 —— 敲过就不再注入目录钩子，免得打断他的输入 */
-  userTyped: boolean
+  /**
+   * 用户最后一次**手敲键盘**的时间戳（程序注入不算）；0 = 从未敲过。
+   *
+   * 为什么不用布尔「敲过就永久放弃」：Agent 执行工具调用是往这个终端里注入命令的，
+   * 那不代表用户想打字。两者混为一谈时，Agent 一跑就等价于替用户敲了键，目录钩子
+   * 被永久放弃 —— 整条会话都不再上报目录，文件面板再也不跟随终端。
+   */
+  lastUserInputAt: number
   /** 目录跟踪钩子（OSC 7）的注入状态机，仅在宿主机 shell 上启用 */
   integration?: ShellIntegration
 }
@@ -456,7 +462,7 @@ export class SshManager {
         return
       }
 
-      const rec: TerminalRecord = { stream, profileId: args.profileId, userTyped: false }
+      const rec: TerminalRecord = { stream, profileId: args.profileId, lastUserInputAt: 0 }
 
       // 宿主机 shell 挂目录跟踪钩子：远端每次打印提示符都会上报 PWD，
       // 渲染层据此把文件面板同步到同一个目录。容器内 shell 不注入。
@@ -469,7 +475,8 @@ export class SshManager {
               /* 通道已关闭 */
             }
           },
-          () => rec.userTyped
+          // 只有「用户真的在敲键盘」才让路；Agent 注入命令、文件面板发 cd 都不算
+          () => Date.now() - rec.lastUserInputAt < USER_IDLE_MS
         )
       }
 
@@ -508,11 +515,17 @@ export class SshManager {
     }
   }
 
-  writeTerminal(termId: string, data: string): void {
+  /**
+   * 往终端写数据。
+   *
+   * @param internal 程序注入传 true（Agent 命令 / 补全插入 / 文件面板的 cd）。
+   *                 只有用户真在敲键盘才该推迟目录钩子的注入 —— 把程序注入也算进去，
+   *                 钩子会被永久放弃，整条会话的文件面板就不再跟随终端了。
+   */
+  writeTerminal(termId: string, data: string, internal = false): void {
     const t = this.terminals.get(termId)
     if (!t) return
-    // 只要用户自己开始敲键，就放弃尚未发出的目录钩子（避免在他的输入中途插话）
-    if (t.integration && !t.integration.done) t.userTyped = true
+    if (!internal && t.integration && !t.integration.done) t.lastUserInputAt = Date.now()
     t.stream.write(data)
   }
 

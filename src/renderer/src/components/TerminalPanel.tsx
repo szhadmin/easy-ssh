@@ -114,8 +114,17 @@ export function TerminalPanel({
   const applyInjectRef = useRef<((text: string, execute?: boolean) => void) | null>(null)
   const pendingInjectRef = useRef<{ text: string; execute?: boolean } | null>(null)
 
+  /** 用户自己的键盘输入（会用来推迟远端目录钩子的注入） */
   const write = useCallback((data: string) => {
     void window.api.term.write(termId, data)
+  }, [termId])
+
+  /**
+   * 程序注入：Agent 执行命令、补全结果插入、AI 面板「插入终端」。
+   * 必须与手敲输入区分开 —— 它不代表用户想打字，不该打断远端目录钩子的注入。
+   */
+  const writeProgram = useCallback((data: string) => {
+    void window.api.term.write(termId, data, true)
   }, [termId])
 
   useEffect(() => {
@@ -221,11 +230,12 @@ export function TerminalPanel({
      */
     const applyInject = (text: string, execute = false): void => {
       if (acOpenRef.current) setAcOpen(false)
-      write('\x15') // Ctrl+U：先清掉当前输入行
-      write(text)
+      // 程序注入：不能算「用户敲键盘」，否则会打断远端目录钩子的注入
+      writeProgram('\x15') // Ctrl+U：先清掉当前输入行
+      writeProgram(text)
       bufRef.current = text
       if (execute) {
-        write('\r')
+        writeProgram('\r')
         bufRef.current = ''
       }
       term.focus()
@@ -402,11 +412,12 @@ export function TerminalPanel({
       setAcOpen(false)
       if (!plan || !item) return
       const next = applyCompletion(bufRef.current, plan, item.value)
-      write('\x15') // Ctrl+U：清掉当前输入行
-      write(next)
+      // 程序注入：不算「用户敲键盘」
+      writeProgram('\x15') // Ctrl+U：清掉当前输入行
+      writeProgram(next)
       bufRef.current = next
     },
-    [write]
+    [writeProgram]
   )
   const acceptRef = useRef(accept)
   useEffect(() => {
@@ -422,8 +433,9 @@ export function TerminalPanel({
 
   const insertCommand = (cmd: string): void => {
     setAcOpen(false)
-    write('\x15')
-    write(cmd)
+    // 以下都是程序注入（按钮 / 补全触发），统一走 writeProgram
+    writeProgram('\x15')
+    writeProgram(cmd)
     bufRef.current = cmd
     termRef.current?.focus()
   }
@@ -431,7 +443,7 @@ export function TerminalPanel({
   const doClear = (): void => {
     setAcOpen(false)
     termRef.current?.clear()
-    write('clear\r')
+    writeProgram('clear\r')
     bufRef.current = ''
   }
 
@@ -449,7 +461,8 @@ export function TerminalPanel({
     try {
       const text = await navigator.clipboard.readText()
       if (!text) return
-      write(text)
+      // 粘贴是一次性灌入整段内容，不是持续打字，按程序注入处理
+      writeProgram(text)
       toast('info', '已粘贴', '如内容有多行，远端 shell 会逐行执行，请留意')
     } catch {
       toast('warn', '粘贴失败', '系统剪贴板不可用，请用 Ctrl+V')
@@ -736,7 +749,7 @@ export function TerminalPanel({
           onCancel={() => setDanger(null)}
           onConfirm={() => {
             setDanger(null)
-            write('\r')
+            writeProgram('\r')
             bufRef.current = ''
             termRef.current?.focus()
           }}

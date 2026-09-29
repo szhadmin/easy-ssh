@@ -2,6 +2,8 @@ import { create } from 'zustand'
 import type {
   AgentExecutionMode,
   AgentRunEvent,
+  AgentHistoryTurn,
+  AgentMemoryFact,
   AgentRunView,
   AgentToolExecRequest,
   AgentToolStep,
@@ -172,6 +174,8 @@ interface State {
   connEpoch: Record<string, number>
   /** 终端 Agent：每台连接一条时间线，按轮次累积，旧轮不再被覆盖 */
   agentRuns: Record<string, AgentRunView[]>
+  /** Agent 的跨会话长期记忆（按服务器）；落盘在主进程，重开应用仍在 */
+  agentMemory: Record<string, AgentMemoryFact[]>
   /** 正在等用户授权的步骤：面板据此渲染确认条 */
   agentPendingConfirm: {
     runId: string
@@ -179,6 +183,8 @@ interface State {
     profileId: string
     intent: string
     command: string
+    /** 是否为写操作 / 危险命令（由主进程标记或本地正则命中） */
+    dangerous: boolean
   } | null
   agentExecutionMode: AgentExecutionMode
   /** AI 助手：模型配置（不含明文 Key） */
@@ -229,6 +235,12 @@ interface State {
   agentApplyEvent: (e: AgentRunEvent) => void
   /** 主进程请求：在某台服务器当前可见的终端里执行一条命令，并把结果回传 */
   agentHandleToolExec: (req: AgentToolExecRequest) => Promise<void>
+  /** 长期记忆：从主进程拉取这台服务器记下的全部事实 */
+  loadAgentMemory: (profileId: string) => Promise<void>
+  /** 手动补一条（标 source=user，与模型自己记的区分开） */
+  addAgentMemory: (profileId: string, text: string) => Promise<void>
+  removeAgentMemory: (profileId: string, id: string) => Promise<void>
+  clearAgentMemory: (profileId: string) => Promise<void>
   toast: (type: Toast['type'], title: string, message?: string) => void
   dismissToast: (id: string) => void
 }
@@ -280,6 +292,38 @@ function buildAgentContext(s: State, profileId: string): string {
     lines.map((l) => `- ${l}`).join('\n') +
     '\n不要反问以上已经给出的信息；如果还需要别的信息，直接给命令让用户执行。'
   )
+}
+
+/**
+ * 带进模型的历史对话总预算（字符）。
+ *
+ * 给历史留够「记得住」的量，又不能把窗口顶满 —— 系统提示词、当前服务器环境、
+ * 长期记忆都要占地方，真正留给推理的空间不能太窄。
+ */
+const AGENT_HISTORY_BUDGET = 6000
+
+/**
+ * 挑出要带进模型的「前几轮」。
+ *
+ * 从最近一轮往回取，直到预算用尽；只带目标与结论，不带每一步的命令与终端输出
+ * （后者又多又碎，全带上会迅速顶满窗口）。
+ * 跳过没有结论的轮次 —— 还在跑的、报错的、被中止的半截对话带进去只会误导模型。
+ */
+function buildAgentHistory(runs: AgentRunView[], currentRunId: string): AgentHistoryTurn[] {
+  const picked: AgentHistoryTurn[] = []
+  let used = 0
+  for (let i = runs.length - 1; i >= 0; i--) {
+    const r = runs[i]
+    if (r.id === currentRunId) continue
+    const goal = (r.goal || '').trim()
+    const conclusion = (r.conclusion || r.text || '').trim()
+    if (!goal || !conclusion) continue
+    const cost = goal.length + conclusion.length
+    if (used + cost > AGENT_HISTORY_BUDGET) break
+    used += cost
+    picked.unshift({ goal, conclusion })
+  }
+  return picked
 }
 
 export const useStore = create<State>((set, get) => {
@@ -348,7 +392,8 @@ export const useStore = create<State>((set, get) => {
     runId: string,
     stepId: string,
     intent: string,
-    command: string
+    command: string,
+    meta: { tool?: string; danger?: boolean } = {}
   ): void {
     set((s) => {
       const list = s.agentRuns[profileId]
@@ -360,6 +405,8 @@ export const useStore = create<State>((set, get) => {
           id: stepId,
           intent: intent || '执行命令',
           command,
+          tool: meta.tool,
+          danger: meta.danger,
           status: 'pending',
           thinking: r.text.trim()
         }
@@ -449,6 +496,7 @@ export const useStore = create<State>((set, get) => {
   termCwd: {},
   connEpoch: {},
   agentRuns: {},
+  agentMemory: {},
   agentPendingConfirm: null,
   agentExecutionMode: 'manual',
   agentConfig: null,
@@ -800,6 +848,8 @@ export const useStore = create<State>((set, get) => {
           runId,
           profileId,
           goal: text,
+          // 带上这台服务器之前几轮的概要，模型才不会「失忆」
+          history: buildAgentHistory(timeline, runId),
           roleId,
           systemExtra: st.agentConfig?.prompts?.[roleId],
           context: st.agentContext ? buildAgentContext(st, profileId) : ''
@@ -823,7 +873,10 @@ export const useStore = create<State>((set, get) => {
         patchRun(profileId, e.runId, (r) => ({ reasoning: (r.reasoning ?? '') + e.text }))
         break
       case 'tool-call':
-        commitThinking(profileId, e.runId, e.stepId, e.intent, e.command)
+        commitThinking(profileId, e.runId, e.stepId, e.intent, e.command, {
+          tool: e.tool,
+          danger: e.danger
+        })
         break
       case 'tool-done':
         patchStep(profileId, e.runId, e.stepId, {
@@ -851,14 +904,59 @@ export const useStore = create<State>((set, get) => {
       case 'aborted':
         patchRun(profileId, e.runId, { state: 'aborted', activity: '已停止。' })
         break
+      case 'memory':
+        // 模型用 remember 记了新事实：就地更新列表，面板与设置里立刻可见
+        set((s) => ({ agentMemory: { ...s.agentMemory, [profileId]: e.facts } }))
+        break
       default:
         break
     }
   },
 
+  /* ------------------------------------------------ 跨会话长期记忆 */
+
+  async loadAgentMemory(profileId) {
+    try {
+      const list = await unwrap(window.api.agent.listMemory(profileId))
+      set((s) => ({ agentMemory: { ...s.agentMemory, [profileId]: list } }))
+    } catch {
+      // 读不到记忆不该打扰用户，当作「这台还没记过东西」即可
+    }
+  },
+
+  async addAgentMemory(profileId, text) {
+    try {
+      const r = await unwrap(window.api.agent.addMemory(profileId, text))
+      set((s) => ({ agentMemory: { ...s.agentMemory, [profileId]: r.facts } }))
+      if (!r.added) get().toast('info', '没有新增', r.reason ?? '这条已经记过了')
+    } catch (e) {
+      get().toast('error', '没能保存这条记忆', (e as Error).message)
+    }
+  },
+
+  async removeAgentMemory(profileId, id) {
+    try {
+      const list = await unwrap(window.api.agent.removeMemory(profileId, id))
+      set((s) => ({ agentMemory: { ...s.agentMemory, [profileId]: list } }))
+    } catch (e) {
+      get().toast('error', '删除失败', (e as Error).message)
+    }
+  },
+
+  async clearAgentMemory(profileId) {
+    try {
+      const list = await unwrap(window.api.agent.clearMemory(profileId))
+      set((s) => ({ agentMemory: { ...s.agentMemory, [profileId]: list } }))
+      get().toast('success', '已清空这台服务器的长期记忆')
+    } catch (e) {
+      get().toast('error', '清空失败', (e as Error).message)
+    }
+  },
+
   async agentHandleToolExec(req) {
     const mode = get().agentExecutionMode
-    const dangerous = isDangerous(req.command)
+    // 主进程声明的写操作（如结构化 write_file）+ 正则命中的危险命令，合并成同一条闸门
+    const dangerous = req.dangerous === true || isDangerous(req.command)
     // 手动：每一步都要点一下；受限：只有敏感命令才拦；完全信任：普通命令直接跑
     const needsConfirm = mode === 'manual' || (mode === 'guarded' && dangerous)
 
@@ -874,7 +972,8 @@ export const useStore = create<State>((set, get) => {
           stepId: req.stepId,
           profileId: req.profileId,
           intent: req.intent,
-          command: req.command
+          command: req.command,
+          dangerous
         }
       })
       const approved = await new Promise<boolean>((resolve) => {

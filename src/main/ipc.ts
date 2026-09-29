@@ -23,6 +23,7 @@ import * as store from './store'
 import * as monitor from './monitor'
 import * as docker from './docker'
 import * as agent from './agent'
+import * as agentMemory from './agent-memory'
 import { resolveToolExec } from './agent-bridge'
 import { clearCompleteCache, completeDynamic } from './complete'
 
@@ -295,8 +296,8 @@ export function registerIpc(ssh: SshManager): void {
     ssh.openTerminal(args)
     return true
   })
-  handle(CH.TERM_WRITE, (termId: string, data: string) => {
-    ssh.writeTerminal(termId, data)
+  handle(CH.TERM_WRITE, (termId: string, data: string, internal?: boolean) => {
+    ssh.writeTerminal(termId, data, internal === true)
     return true
   })
   handle(CH.TERM_RESIZE, (termId: string, cols: number, rows: number) => {
@@ -463,6 +464,17 @@ export function registerIpc(ssh: SshManager): void {
   })
 
   handle(CH.AGENT_ABORT, (runId: string) => agent.abort(runId))
+
+  /* ---- Agent 的跨会话长期记忆（按服务器） ---- */
+
+  handle(CH.AGENT_MEMORY_LIST, (profileId: string) => agentMemory.listFacts(profileId))
+  handle(CH.AGENT_MEMORY_ADD, (profileId: string, text: string) =>
+    agentMemory.addFact(profileId, text, 'user')
+  )
+  handle(CH.AGENT_MEMORY_REMOVE, (profileId: string, id: string) =>
+    agentMemory.removeFact(profileId, id)
+  )
+  handle(CH.AGENT_MEMORY_CLEAR, (profileId: string) => agentMemory.clearFacts(profileId))
 
   /* ---- 应用 ---- */
 

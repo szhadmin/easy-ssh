@@ -60,6 +60,15 @@ export const INTEGRATION_PAYLOAD = {
   finish: FINISH
 }
 
+/** 远端登录横幅刷完之后，安静多久就动手注入 */
+const QUIET_MS = 700
+/** 用户停手多久之后，才认为「可以插话注入」 */
+export const USER_IDLE_MS = 1500
+/** 被用户输入挡回来时的重试间隔（必须大于 USER_IDLE_MS，否则每次都还判定为忙） */
+const DEFER_MS = 2000
+/** 连续被挡多久就彻底收手（遇到一直在敲的用户，别去打断他） */
+const MAX_DEFER_MS = 12000
+
 type Phase = 'idle' | 'muted' | 'done'
 
 /**
@@ -70,11 +79,19 @@ export class ShellIntegration {
   private phase: Phase = 'idle'
   private quietTimer: ReturnType<typeof setTimeout> | null = null
   private fallbackTimer: ReturnType<typeof setTimeout> | null = null
+  /** 第一次因为用户正在输入而推迟的时刻，用来给「一直敲」兜一个放弃上限 */
+  private deferSince = 0
 
   constructor(
     private readonly write: (data: string) => void,
-    /** 用户是否已经自己敲过键盘（敲过就放弃注入，避免打断他的输入） */
-    private readonly aborted: () => boolean
+    /**
+     * 用户此刻是否正在敲键盘。
+     *
+     * 注意这里问的是「**用户**在不在打字」，程序注入（Agent 命令、文件面板的 cd、
+     * 补全插入）不算 —— 早期把两者混为一谈，结果 Agent 一执行命令就等价于替用户
+     * 敲了键，钩子被永久放弃，整条会话的目录跟随全部失效。
+     */
+    private readonly busy: () => boolean
   ) {
     // 兜底：即使远端一直没有输出（比如登录横幅是空的），也要在 6s 内完成
     this.fallbackTimer = setTimeout(() => this.step1(), 6000)
@@ -92,13 +109,13 @@ export class ShellIntegration {
       this.step2()
       return
     }
-    if (this.aborted()) {
-      this.finish()
+    if (this.busy()) {
+      this.defer()
       return
     }
     // 登录横幅 / motd 还在刷，等它安静下来再动手
     if (this.quietTimer) clearTimeout(this.quietTimer)
-    this.quietTimer = setTimeout(() => this.step1(), 700)
+    this.quietTimer = setTimeout(() => this.step1(), QUIET_MS)
   }
 
   /** 通道关闭等情况下的收尾：若已经把回显关掉了，必须补回来 */
@@ -113,10 +130,25 @@ export class ShellIntegration {
     this.finish()
   }
 
+  /**
+   * 用户正在输入，先让一让。
+   *
+   * 以前这里直接放弃注入，代价是「连上服务器就顺手敲了一句命令」的会话从此再也
+   * 没有目录跟随（用户完全不知道发生了什么）。钩子脚本本身是幂等的（三重判重），
+   * 晚一点注入没有任何副作用，所以改成等用户停手再补上。
+   */
+  private defer(): void {
+    this.clearTimers()
+    const now = Date.now()
+    if (!this.deferSince) this.deferSince = now
+    if (now - this.deferSince >= MAX_DEFER_MS) return this.finish()
+    this.quietTimer = setTimeout(() => this.step1(), DEFER_MS)
+  }
+
   private step1(): void {
     if (this.phase !== 'idle') return
     this.clearTimers()
-    if (this.aborted()) return this.finish()
+    if (this.busy()) return this.defer()
     this.phase = 'muted'
     this.safeWrite(`${LINE_ECHO_OFF}\r`)
     // 远端如果对 stty 完全没反应（没有 tty、没有 stty），别卡死在这

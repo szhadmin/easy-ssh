@@ -1970,6 +1970,82 @@ textarea.input {
   color: #fff;
 }
 
+/* 配置弹窗里的长期记忆列表 */
+.agent-memory {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 190px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px;
+  background: var(--bg);
+}
+
+.agent-memory-empty {
+  padding: 6px 4px;
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.agent-memory-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 4px 4px 6px;
+  border-radius: 6px;
+}
+
+.agent-memory-item:hover {
+  background: #fafbff;
+}
+
+.agent-memory-src {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  line-height: 1.5;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-2);
+  background: var(--panel);
+}
+
+.agent-memory-src.user {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.agent-memory-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.agent-memory-del {
+  flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+}
+
+.agent-memory-del:hover {
+  color: var(--red);
+  background: var(--red-soft);
+}
+
 
 /* ------------------------------------------------- Agent 多轮时间线 */
 

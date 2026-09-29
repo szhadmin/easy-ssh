@@ -28,6 +28,7 @@ export function AgentPanel({
   const agentConfirmStep = useStore((s) => s.agentConfirmStep)
   const agentStop = useStore((s) => s.agentStop)
   const agentClear = useStore((s) => s.agentClear)
+  const loadAgentMemory = useStore((s) => s.loadAgentMemory)
   const saveAgentConfig = useStore((s) => s.saveAgentConfig)
   const injectTerm = useStore((s) => s.injectTerm)
   const setTab = useStore((s) => s.setTab)
@@ -52,6 +53,12 @@ export function AgentPanel({
     if (!el || !stickToBottom.current) return
     el.scrollTop = el.scrollHeight
   }, [runs])
+
+  // 打开面板 / 换服务器时把长期记忆拉进来
+  // （模型运行中用 remember 记了新事实会推 memory 事件，由 store 就地更新）
+  useEffect(() => {
+    void loadAgentMemory(profile.id)
+  }, [profile.id, loadAgentMemory])
 
   const onScroll = (): void => {
     const el = bodyRef.current
@@ -234,7 +241,9 @@ export function AgentPanel({
         )}
       </div>
 
-      {settingsOpen ? <AgentSettings onClose={() => setSettingsOpen(false)} /> : null}
+      {settingsOpen ? (
+        <AgentSettings profileId={profile.id} onClose={() => setSettingsOpen(false)} />
+      ) : null}
       {pendingExec ? (
         <Confirm
           title="确认执行这条危险命令？"
@@ -364,6 +373,16 @@ function StepBlock({
     <div className={cls('agent-step', `st-${step.status}`)}>
       <div className="agent-step-head">
         <span className="agent-step-no">第 {index + 1} 步</span>
+        {step.tool && step.tool !== 'run_command' ? (
+          <span className="chip accent" title="由专用工具生成，参数已转义">
+            {step.tool}
+          </span>
+        ) : null}
+        {step.danger ? (
+          <span className="chip amber" title="这是写操作，会改动服务器上的文件">
+            写操作
+          </span>
+        ) : null}
         <span className="agent-step-intent">{step.intent}</span>
         <span className={cls('agent-step-state', `st-${step.status}`)}>
           {STEP_STATE_LABEL[step.status]}
@@ -384,14 +403,22 @@ function StepBlock({
       ) : null}
 
       {step.status === 'confirming' ? (
-        <div className="row" style={{ marginTop: 8 }}>
-          <Btn size="sm" variant="primary" onClick={() => onConfirm(true)}>
-            在终端执行
-          </Btn>
-          <Btn size="sm" variant="ghost" onClick={() => onConfirm(false)}>
-            拒绝并停止
-          </Btn>
-        </div>
+        <>
+          {step.danger ? (
+            <div className="banner warn" style={{ margin: '8px 0 0' }}>
+              <Icons.warn size={14} />
+              <div>这是写操作：命令会把内容写入服务器上的文件，覆盖原内容不可撤销。确认后再执行。</div>
+            </div>
+          ) : null}
+          <div className="row" style={{ marginTop: 8 }}>
+            <Btn size="sm" variant="primary" onClick={() => onConfirm(true)}>
+              在终端执行
+            </Btn>
+            <Btn size="sm" variant="ghost" onClick={() => onConfirm(false)}>
+              拒绝并停止
+            </Btn>
+          </div>
+        </>
       ) : null}
 
       {step.output !== undefined ? (
