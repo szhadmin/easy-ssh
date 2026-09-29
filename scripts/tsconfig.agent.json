@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "skipLibCheck": true,
+    "strict": false,
+    "noImplicitAny": false,
+    "esModuleInterop": true,
+    "outDir": "../.tmp-agent-cjs",
+    "rootDir": "..",
+    "baseUrl": "..",
+    "paths": { "@shared/*": ["src/shared/*"] }
+  },
+  "include": ["../src/main/agent.ts", "../src/shared/agent-roles.ts"]
+}

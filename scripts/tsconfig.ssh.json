@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "lib": ["ES2022"],
+    "skipLibCheck": true,
+    "strict": false,
+    "noImplicitAny": false,
+    "esModuleInterop": true,
+    "outDir": "../.tmp-ssh-cjs",
+    "rootDir": "..",
+    "baseUrl": "..",
+    "paths": { "@shared/*": ["src/shared/*"] },
+    "types": []
+  },
+  "include": [
+    "../src/main/ssh-manager.ts",
+    "../src/main/shell-integration.ts",
+    "../src/shared/types.ts"
+  ]
+}

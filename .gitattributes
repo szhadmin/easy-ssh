@@ -1,0 +1,27 @@
+# 默认按内容自动判断文本文件，仓库内统一存 LF
+* text=auto
+
+# 明确按 LF 存储
+*.ts    text eol=lf
+*.tsx   text eol=lf
+*.js    text eol=lf
+*.cjs   text eol=lf
+*.mjs   text eol=lf
+*.json  text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+LICENSE text eol=lf
+
+# Windows 批处理 / NSIS 脚本需要 CRLF
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.nsh   text eol=crlf
+*.nsi   text eol=crlf
+
+# 二进制文件不做换行转换
+*.png   binary
+*.ico   binary
+*.exe   binary
+*.7z    binary

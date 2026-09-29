@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "lib": ["ES2022", "DOM"],
+    "skipLibCheck": true,
+    "strict": false,
+    "noImplicitAny": false,
+    "esModuleInterop": true,
+    "outDir": "../.tmp-check-cjs",
+    "rootDir": "..",
+    "baseUrl": "..",
+    "paths": { "@shared/*": ["src/shared/*"] },
+    "types": []
+  },
+  "include": [
+    "../src/renderer/src/lib/complete.ts",
+    "../src/renderer/src/lib/commands.ts",
+    "../src/shared/types.ts"
+  ]
+}

@@ -1,0 +1,54 @@
+appId: com.szhadmin.easyssh
+productName: EasySSH
+copyright: Copyright © 2026 szhadmin
+
+directories:
+  # 旧 dist/win-unpacked 的 exe 被系统短暂占用时，改用独立输出目录避免阻塞新包。
+  output: release-1.0.2
+  buildResources: build
+
+# 只打包必需文件；renderer/main 已被 vite 打进 out/
+files:
+  - out/**/*
+  - package.json
+  - '!**/*.map'
+  - '!**/{.DS_Store,.git,.gitignore,README.md,*.md}'
+
+# ssh2 是纯 JS 实现（cpu-features 为可选原生依赖，缺省自动降级），
+# 关闭原生模块重编译以免依赖本机 VS Build Tools。
+npmRebuild: false
+
+# 不发布，仅本地出包
+publish: null
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: build/icon.ico
+  artifactName: ${productName}-Setup-${version}.${ext}
+  requestedExecutionLevel: asInvoker
+  legalTrademarks: ''
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: true
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: always
+  createStartMenuShortcut: true
+  shortcutName: Easy SSH
+  menuCategory: false
+  deleteAppDataOnUninstall: false
+  runAfterFinish: true
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  installerHeaderIcon: build/icon.ico
+  installerLanguages:
+    - zh_CN
+  language: '2052'
+  include: build/installer.nsh
+  artifactName: ${productName}-Setup-${version}.${ext}
+
+portable:
+  artifactName: ${productName}-Portable-${version}.${ext}

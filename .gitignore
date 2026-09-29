@@ -1,0 +1,46 @@
+# 依赖
+node_modules/
+
+# 构建与打包产物
+out/
+dist/
+dist-out/
+release/
+release-*/
+*.tsbuildinfo
+
+# 日志
+*.log
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# 图标预览（临时产物）
+build/icon-preview.png
+
+# 本地缓存
+.npm-cache/
+
+# electron-vite 临时配置文件
+electron.vite.config.*.mjs
+
+# 自检脚本的临时产物
+.tmp-check/
+.tmp-check-cjs/
+.tmp-ssh-cjs/
+.tmp-agent-cjs/
+.tmp-userdata/
+.tmp-userdata*/
+.tmp-ud-*/
+.tmp-probe*
+.tmp-mock-*.log
+.tmp-smoke-*.png
+.tmp-ui-out.log
+mock-ssh.log
+smoke-*.png
+
+# 本地工作区数据（含冒烟截图与工作日志，不入库）
+.workbuddy/
